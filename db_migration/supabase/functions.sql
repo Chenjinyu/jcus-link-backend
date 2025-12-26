@@ -1,5 +1,5 @@
 -- ============================================================================
--- Search stored function that returns article or profile info
+-- SEARCH ALL CONTENT
 -- ============================================================================
 DROP FUNCTION IF EXISTS search_all_content(vector, text, float, int);
 
@@ -9,20 +9,19 @@ CREATE OR REPLACE FUNCTION search_all_content(
   match_threshold FLOAT DEFAULT 0.7,
   match_count INT DEFAULT 10
 )
--- Defines the structure of row returned
--- it can return text, integer, uuid, etc.
 RETURNS TABLE ( 
   embedding_id UUID,
   document_id UUID,
   article_id UUID,
   profile_id UUID,
-  content_type TEXT,
+  personal_attribute_id UUID,
+  content_type TEXT,  -- Derived from which table has data
   title TEXT,
   chunk_text TEXT,
   similarity FLOAT
 )
 LANGUAGE plpgsql
-SET search_path = public  -- explicitly set search path to prevent search path hijacking attachs.
+SET search_path = public
 AS $$
 BEGIN
   RETURN QUERY
@@ -31,25 +30,33 @@ BEGIN
     d.id AS document_id,
     a.id AS article_id,
     p.id AS profile_id,
-    ct.name AS content_type,
-    COALESCE(d.title, p.data->>'title', 'Untitled') AS title,
+    pa.id AS personal_attribute_id,
+    -- Derive content_type from which table has data
+    CASE 
+      WHEN a.id IS NOT NULL THEN 'article'
+      WHEN p.id IS NOT NULL THEN p.category
+      WHEN pa.id IS NOT NULL THEN pa.attribute_type
+      ELSE 'document'
+    END AS content_type,
+    COALESCE(d.title, a.title, p.data->>'title', pa.title, 'Untitled') AS title,
     e.chunk_text,
     1 - (e.embedding <=> query_embedding) AS similarity
   FROM embeddings e
   JOIN documents d ON e.document_id = d.id
-  JOIN content_types ct ON d.content_type_id = ct.id
-  LEFT JOIN articles a ON a.document_id = d.id      -- May be article
-  LEFT JOIN profile_data p ON p.document_id = d.id  -- May be profile
+  LEFT JOIN articles a ON a.document_id = d.id
+  LEFT JOIN profile_data p ON p.document_id = d.id
+  LEFT JOIN personal_attributes pa ON pa.document_id = d.id
   WHERE 
     d.user_id = user_id_filter
     AND (1 - (e.embedding <=> query_embedding)) > match_threshold
+    AND d.deleted_at IS NULL
   ORDER BY similarity DESC
   LIMIT match_count;
 END;
 $$;
 
 -- ============================================================================
--- SEARCH DOCUMENTS WITH ARTICLE, PROFILE DATA, AND PERSONAL ATTRIBUTES
+-- SEARCH DOCUMENTS (Simplified - no content_types)
 -- ============================================================================
 DROP FUNCTION IF EXISTS search_documents(vector, uuid, float, int, text, text[], text[]);
 
@@ -74,7 +81,8 @@ RETURNS TABLE (
   chunk_index INTEGER,
   total_chunks INTEGER,
   content_type TEXT,
-  attribute_type TEXT,
+  category TEXT,  -- For profile_data
+  attribute_type TEXT,  -- For personal_attributes
   similarity FLOAT,
   metadata JSONB,
   tags TEXT[],
@@ -83,99 +91,152 @@ RETURNS TABLE (
 LANGUAGE plpgsql
 SET search_path = public
 AS $$
+DECLARE
+  query_dims INTEGER;
 BEGIN
-  RETURN QUERY
-  SELECT 
-    e.id AS embedding_id,
-    d.id AS document_id,
-    a.id AS article_id,
-    p.id AS profile_data_id,
-    pa.id AS personal_attribute_id,
-    COALESCE(
-      d.title, 
-      a.title, 
-      p.data->>'title',
-      pa.title,
-      'Untitled'
-    ) AS title,
-    d.content,
-    e.chunk_text,
-    e.chunk_index,
-    e.total_chunks,
-    ct.name AS content_type,
-    pa.attribute_type,
-    1 - (e.embedding <=> query_embedding) AS similarity,
-    d.metadata,
-    d.tags,
-    d.created_at
-  FROM embeddings e
-  JOIN documents d ON e.document_id = d.id
-  JOIN content_types ct ON d.content_type_id = ct.id
-  LEFT JOIN articles a ON a.document_id = d.id
-  LEFT JOIN profile_data p ON p.document_id = d.id
-  LEFT JOIN personal_attributes pa ON pa.document_id = d.id
-  WHERE 
-    e.embedding_model_id = model_id
-    AND (1 - (e.embedding <=> query_embedding)) > match_threshold
-    AND d.is_current = TRUE
-    AND d.deleted_at IS NULL
-    AND (filter_user_id IS NULL OR d.user_id = filter_user_id)
-    AND (filter_content_types IS NULL OR ct.name = ANY(filter_content_types))
-    AND (filter_tags IS NULL OR d.tags && filter_tags)
-  ORDER BY e.embedding <=> query_embedding
-  LIMIT match_count;
+  -- Get query vector dimensions
+  query_dims := vector_dims(query_embedding);
+  
+  -- Execute query with dimension-specific casting
+  IF query_dims = 768 THEN
+    RETURN QUERY
+    SELECT 
+      e.id AS embedding_id,
+      d.id AS document_id,
+      a.id AS article_id,
+      p.id AS profile_data_id,
+      pa.id AS personal_attribute_id,
+      COALESCE(d.title, a.title, p.data->>'title', pa.title, 'Untitled') AS title,
+      d.content,
+      e.chunk_text,
+      e.chunk_index,
+      e.total_chunks,
+      -- Derive content_type from which table has data
+      CASE 
+        WHEN a.id IS NOT NULL THEN 'article'
+        WHEN p.id IS NOT NULL THEN p.category
+        WHEN pa.id IS NOT NULL THEN pa.attribute_type
+        ELSE 'document'
+      END AS content_type,
+      p.category,
+      pa.attribute_type,
+      1 - (e.embedding::vector(768) <=> query_embedding) AS similarity,
+      d.metadata,
+      d.tags,
+      d.created_at
+    FROM embeddings e
+    JOIN documents d ON e.document_id = d.id
+    LEFT JOIN articles a ON a.document_id = d.id
+    LEFT JOIN profile_data p ON p.document_id = d.id
+    LEFT JOIN personal_attributes pa ON pa.document_id = d.id
+    WHERE 
+      e.embedding_model_id = model_id
+      AND (1 - (e.embedding::vector(768) <=> query_embedding)) > match_threshold
+      AND d.is_current = TRUE
+      AND d.deleted_at IS NULL
+      AND (filter_user_id IS NULL OR d.user_id = filter_user_id)
+      AND (filter_content_types IS NULL OR 
+        CASE 
+          WHEN a.id IS NOT NULL THEN 'article'
+          WHEN p.id IS NOT NULL THEN p.category
+          WHEN pa.id IS NOT NULL THEN pa.attribute_type
+          ELSE 'document'
+        END = ANY(filter_content_types))
+      AND (filter_tags IS NULL OR d.tags && filter_tags)
+    ORDER BY e.embedding::vector(768) <=> query_embedding
+    LIMIT match_count;
+    
+  ELSIF query_dims = 1536 THEN
+    RETURN QUERY
+    SELECT 
+      e.id AS embedding_id,
+      d.id AS document_id,
+      a.id AS article_id,
+      p.id AS profile_data_id,
+      pa.id AS personal_attribute_id,
+      COALESCE(d.title, a.title, p.data->>'title', pa.title, 'Untitled') AS title,
+      d.content,
+      e.chunk_text,
+      e.chunk_index,
+      e.total_chunks,
+      CASE 
+        WHEN a.id IS NOT NULL THEN 'article'
+        WHEN p.id IS NOT NULL THEN p.category
+        WHEN pa.id IS NOT NULL THEN pa.attribute_type
+        ELSE 'document'
+      END AS content_type,
+      p.category,
+      pa.attribute_type,
+      1 - (e.embedding::vector(1536) <=> query_embedding) AS similarity,
+      d.metadata,
+      d.tags,
+      d.created_at
+    FROM embeddings e
+    JOIN documents d ON e.document_id = d.id
+    LEFT JOIN articles a ON a.document_id = d.id
+    LEFT JOIN profile_data p ON p.document_id = d.id
+    LEFT JOIN personal_attributes pa ON pa.document_id = d.id
+    WHERE 
+      e.embedding_model_id = model_id
+      AND (1 - (e.embedding::vector(1536) <=> query_embedding)) > match_threshold
+      AND d.is_current = TRUE
+      AND d.deleted_at IS NULL
+      AND (filter_user_id IS NULL OR d.user_id = filter_user_id)
+      AND (filter_content_types IS NULL OR 
+        CASE 
+          WHEN a.id IS NOT NULL THEN 'article'
+          WHEN p.id IS NOT NULL THEN p.category
+          WHEN pa.id IS NOT NULL THEN pa.attribute_type
+          ELSE 'document'
+        END = ANY(filter_content_types))
+      AND (filter_tags IS NULL OR d.tags && filter_tags)
+    ORDER BY e.embedding::vector(1536) <=> query_embedding
+    LIMIT match_count;
+    
+  ELSE
+    RAISE EXCEPTION 'Unsupported vector dimension: %. Supported: 768, 1536', query_dims;
+  END IF;
 END;
 $$;
 
 -- ============================================================================
--- Upsert stored function that inserts a document with embeddings
+-- UPSERT DOCUMENT (Simplified - no content_types)
 -- ============================================================================
 DROP FUNCTION IF EXISTS upsert_document_with_embedding(text, text, text, text, jsonb, text[], text, jsonb);
 
 CREATE OR REPLACE FUNCTION upsert_document_with_embedding(
   p_user_id TEXT,
-  p_content_type TEXT,
   p_title TEXT,
   p_content TEXT,
   p_metadata JSONB DEFAULT '{}'::jsonb,
   p_tags TEXT[] DEFAULT '{}',
   p_embedding_model_name TEXT DEFAULT 'openai-small',
-  p_chunks JSONB DEFAULT '[]'::jsonb  -- Array of {text, embedding, chunk_index}
+  p_chunks JSONB DEFAULT '[]'::jsonb
 )
 RETURNS UUID
 LANGUAGE plpgsql
 SET search_path = public
 AS $$
 DECLARE
-  v_content_type_id UUID;
   v_document_id UUID;
   v_embedding_model_id UUID;
   v_chunk JSONB;
   v_total_chunks INTEGER;
 BEGIN
-  -- Get content type ID
-  SELECT id INTO v_content_type_id
-  FROM content_types
-  WHERE name = p_content_type;
-  
-  IF v_content_type_id IS NULL THEN
-    RAISE EXCEPTION 'Content type % not found', p_content_type;
-  END IF;
-  
   -- Get embedding model ID
   SELECT id INTO v_embedding_model_id
   FROM embedding_models
-  WHERE name = p_embedding_model_name;
+  WHERE name = p_embedding_model_name AND is_active = TRUE;
   
   IF v_embedding_model_id IS NULL THEN
-    RAISE EXCEPTION 'Embedding model % not found', p_embedding_model_name;
+    RAISE EXCEPTION 'Embedding model % not found or not active', p_embedding_model_name;
   END IF;
   
   -- Insert document
   INSERT INTO documents (
-    user_id, content_type_id, title, content, metadata, tags
+    user_id, title, content, metadata, tags
   ) VALUES (
-    p_user_id, v_content_type_id, p_title, p_content, p_metadata, p_tags
+    p_user_id, p_title, p_content, p_metadata, p_tags
   )
   RETURNING id INTO v_document_id;
   
@@ -226,7 +287,7 @@ END;
 $$;
 
 -- ============================================================================
--- ADD PERSONAL ATTRIBUTE WITH DOCUMENT AND EMBEDDING
+-- ADD PERSONAL ATTRIBUTE (Simplified - uses trigger for searchable_text)
 -- ============================================================================
 DROP FUNCTION IF EXISTS add_personal_attribute(text, text, text, text, text[], int, int, uuid[], uuid[], text, boolean);
 
@@ -248,7 +309,6 @@ LANGUAGE plpgsql
 SET search_path = public
 AS $$
 DECLARE
-  v_content_type_id UUID;
   v_document_id UUID;
   v_attribute_id UUID;
   v_searchable_text TEXT;
@@ -256,21 +316,6 @@ DECLARE
 BEGIN
   -- Only create document if searchable
   IF p_create_searchable THEN
-    -- Get content type ID for the attribute type
-    SELECT id INTO v_content_type_id
-    FROM content_types
-    WHERE name = p_attribute_type;
-    
-    IF v_content_type_id IS NULL THEN
-      RAISE EXCEPTION 'Content type % not found. Please add it to content_types table.', p_attribute_type;
-    END IF;
-    
-    -- Build searchable text
-    v_searchable_text := p_title || '. ' || p_description;
-    IF array_length(p_examples, 1) > 0 THEN
-      v_searchable_text := v_searchable_text || '. Examples: ' || array_to_string(p_examples, '. ');
-    END IF;
-    
     -- Get embedding model ID
     SELECT id INTO v_embedding_model_id
     FROM embedding_models
@@ -280,23 +325,30 @@ BEGIN
       RAISE EXCEPTION 'Embedding model % not found or not active', p_embedding_model_name;
     END IF;
     
+    -- Build searchable text (same logic as trigger)
+    v_searchable_text := p_title || '. ' || p_description;
+    IF array_length(p_examples, 1) > 0 THEN
+      v_searchable_text := v_searchable_text || '. Examples: ' || array_to_string(p_examples, '. ');
+    END IF;
+    
     -- Insert document
     INSERT INTO documents (
       user_id, 
-      content_type_id, 
       title, 
       content,
-      metadata
+      metadata,
+      tags
     ) VALUES (
       p_user_id, 
-      v_content_type_id, 
       p_title, 
       v_searchable_text,
       jsonb_build_object(
+        'source', 'personal_attribute',
         'attribute_type', p_attribute_type,
         'importance_score', p_importance_score,
         'confidence_level', p_confidence_level
-      )
+      ),
+      ARRAY[p_attribute_type]
     )
     RETURNING id INTO v_document_id;
     
@@ -317,6 +369,7 @@ BEGIN
   END IF;
   
   -- Insert personal attribute
+  -- Note: searchable_text will be auto-generated by trigger
   INSERT INTO personal_attributes (
     user_id,
     document_id,
@@ -324,7 +377,6 @@ BEGIN
     title,
     description,
     examples,
-    searchable_text,
     importance_score,
     confidence_level,
     related_articles,
@@ -336,7 +388,6 @@ BEGIN
     p_title,
     p_description,
     p_examples,
-    v_searchable_text,
     p_importance_score,
     p_confidence_level,
     p_related_articles,
@@ -349,7 +400,7 @@ END;
 $$;
 
 -- ============================================================================
--- UPDATE PERSONAL ATTRIBUTE (AND OPTIONALLY RECREATE EMBEDDING)
+-- UPDATE PERSONAL ATTRIBUTE (Trigger auto-updates searchable_text)
 -- ============================================================================
 DROP FUNCTION IF EXISTS update_personal_attribute(uuid, text, text, text[], int, int, uuid[], uuid[], boolean);
 
@@ -383,6 +434,7 @@ BEGIN
   END IF;
   
   -- Update personal_attributes table
+  -- Note: Trigger will auto-update searchable_text
   UPDATE personal_attributes
   SET
     title = COALESCE(p_title, title),
@@ -394,30 +446,20 @@ BEGIN
     related_experiences = COALESCE(p_related_experiences, related_experiences),
     updated_at = NOW()
   WHERE id = p_attribute_id
-  RETURNING document_id INTO v_document_id;
+  RETURNING document_id, searchable_text INTO v_document_id, v_searchable_text;
   
   -- If has document and should recreate embedding
   IF v_document_id IS NOT NULL AND p_recreate_embedding THEN
-    -- Get updated values
-    SELECT * INTO v_current_attribute
-    FROM personal_attributes
-    WHERE id = p_attribute_id;
-    
-    -- Build new searchable text
-    v_searchable_text := v_current_attribute.title || '. ' || v_current_attribute.description;
-    IF array_length(v_current_attribute.examples, 1) > 0 THEN
-      v_searchable_text := v_searchable_text || '. Examples: ' || array_to_string(v_current_attribute.examples, '. ');
-    END IF;
-    
-    -- Update document
+    -- Update document with new searchable text
     UPDATE documents
     SET
-      title = v_current_attribute.title,
+      title = (SELECT title FROM personal_attributes WHERE id = p_attribute_id),
       content = v_searchable_text,
       metadata = jsonb_build_object(
-        'attribute_type', v_current_attribute.attribute_type,
-        'importance_score', v_current_attribute.importance_score,
-        'confidence_level', v_current_attribute.confidence_level
+        'source', 'personal_attribute',
+        'attribute_type', (SELECT attribute_type FROM personal_attributes WHERE id = p_attribute_id),
+        'importance_score', (SELECT importance_score FROM personal_attributes WHERE id = p_attribute_id),
+        'confidence_level', (SELECT confidence_level FROM personal_attributes WHERE id = p_attribute_id)
       ),
       updated_at = NOW()
     WHERE id = v_document_id;
@@ -426,11 +468,6 @@ BEGIN
     UPDATE embeddings
     SET chunk_text = v_searchable_text
     WHERE document_id = v_document_id;
-    
-    -- Update searchable_text in personal_attributes
-    UPDATE personal_attributes
-    SET searchable_text = v_searchable_text
-    WHERE id = p_attribute_id;
   END IF;
   
   RETURN TRUE;
@@ -438,56 +475,97 @@ END;
 $$;
 
 -- ============================================================================
--- Create vector indexes for active embedding models
+-- AUTO-UPDATE TRIGGERS FOR SEARCHABLE_TEXT
 -- ============================================================================
-DROP FUNCTION IF EXISTS create_vector_indexes();
 
-CREATE OR REPLACE FUNCTION create_vector_indexes()
-RETURNS TEXT
+-- Personal Attributes
+DROP TRIGGER IF EXISTS update_personal_attributes_searchable_text_trigger ON personal_attributes;
+DROP FUNCTION IF EXISTS update_personal_attributes_searchable_text();
+
+CREATE OR REPLACE FUNCTION update_personal_attributes_searchable_text()
+RETURNS TRIGGER
 LANGUAGE plpgsql
-SET search_path = public  
+SET search_path = public
 AS $$
-DECLARE 
-    model_record RECORD; 
-    index_name TEXT; 
-    lists_count INTEGER;
-    result_message TEXT := '';
-BEGIN 
-    FOR model_record IN 
-        SELECT id, name, dimensions 
-        FROM embedding_models 
-        WHERE is_active = TRUE 
-    LOOP 
-        index_name := 'embeddings_' || replace(model_record.name, '-', '_') || '_idx';
-        lists_count := GREATEST(10, FLOOR(SQRT(model_record.dimensions)));
-        
-        EXECUTE format(
-            'CREATE INDEX IF NOT EXISTS %I ON embeddings 
-             USING ivfflat (embedding vector_cosine_ops)
-             WITH (lists = %s)
-             WHERE embedding_model_id = %L',
-            index_name,
-            lists_count,
-            model_record.id
-        );
-        
-        result_message := result_message || format(
-            'Created index %s for model %s (%s dimensions, %s lists)' || E'\n',
-            index_name,
-            model_record.name,
-            model_record.dimensions,
-            lists_count
-        );
-    END LOOP;
-    
-    RETURN result_message;
+BEGIN
+  -- Build searchable text from title + description + examples
+  NEW.searchable_text := NEW.title || '. ' || NEW.description;
+  
+  IF array_length(NEW.examples, 1) > 0 THEN
+    NEW.searchable_text := NEW.searchable_text || '. Examples: ' || array_to_string(NEW.examples, '. ');
+  END IF;
+  
+  RETURN NEW;
 END;
 $$;
 
+CREATE TRIGGER update_personal_attributes_searchable_text_trigger
+  BEFORE INSERT OR UPDATE ON personal_attributes
+  FOR EACH ROW
+  EXECUTE FUNCTION update_personal_attributes_searchable_text();
+
+-- Profile Data
+DROP TRIGGER IF EXISTS update_profile_data_searchable_text_trigger ON profile_data;
+DROP FUNCTION IF EXISTS update_profile_data_searchable_text();
+
+CREATE OR REPLACE FUNCTION update_profile_data_searchable_text()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+DECLARE
+  text_parts TEXT[] := '{}';
+BEGIN
+  -- Extract searchable fields from JSONB based on common patterns
+  IF NEW.data ? 'title' THEN
+    text_parts := array_append(text_parts, NEW.data->>'title');
+  END IF;
+  
+  IF NEW.data ? 'company' THEN
+    text_parts := array_append(text_parts, NEW.data->>'company');
+  END IF;
+  
+  IF NEW.data ? 'position' THEN
+    text_parts := array_append(text_parts, NEW.data->>'position');
+  END IF;
+  
+  IF NEW.data ? 'description' THEN
+    text_parts := array_append(text_parts, NEW.data->>'description');
+  END IF;
+  
+  IF NEW.data ? 'skills' THEN
+    -- Handle both string and array
+    IF jsonb_typeof(NEW.data->'skills') = 'array' THEN
+      text_parts := array_append(text_parts, 'Skills: ' || 
+        (SELECT string_agg(value::text, ', ') FROM jsonb_array_elements_text(NEW.data->'skills')));
+    ELSE
+      text_parts := array_append(text_parts, 'Skills: ' || (NEW.data->>'skills'));
+    END IF;
+  END IF;
+  
+  IF NEW.data ? 'achievements' THEN
+    text_parts := array_append(text_parts, NEW.data->>'achievements');
+  END IF;
+  
+  IF NEW.data ? 'responsibilities' THEN
+    text_parts := array_append(text_parts, NEW.data->>'responsibilities');
+  END IF;
+  
+  -- Join all parts
+  NEW.searchable_text := array_to_string(text_parts, '. ');
+  
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER update_profile_data_searchable_text_trigger
+  BEFORE INSERT OR UPDATE ON profile_data
+  FOR EACH ROW
+  EXECUTE FUNCTION update_profile_data_searchable_text();
+
 -- ============================================================================
--- Update triggers to update the updated_at column for all tables
+-- UPDATED TRIGGER: update_updated_at_column
 -- ============================================================================
--- Drop triggers if they exist (to avoid errors on re-run)
 DROP TRIGGER IF EXISTS update_documents_updated_at ON documents;
 DROP TRIGGER IF EXISTS update_profile_data_updated_at ON profile_data;
 DROP TRIGGER IF EXISTS update_articles_updated_at ON articles;
@@ -497,12 +575,15 @@ DROP TRIGGER IF EXISTS update_personal_attributes_updated_at ON personal_attribu
 DROP FUNCTION IF EXISTS update_updated_at_column();
 
 CREATE OR REPLACE FUNCTION update_updated_at_column()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER 
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
 BEGIN
   NEW.updated_at = NOW();
   RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 -- Create triggers
 CREATE TRIGGER update_documents_updated_at
@@ -530,3 +611,46 @@ CREATE TRIGGER update_personal_attributes_updated_at
   FOR EACH ROW
   EXECUTE FUNCTION update_updated_at_column();
 
+-- ============================================================================
+-- DIMENSION VALIDATION TRIGGER
+-- ============================================================================
+DROP TRIGGER IF EXISTS validate_embedding_dimension ON embeddings;
+DROP FUNCTION IF EXISTS check_embedding_dimension();
+
+CREATE OR REPLACE FUNCTION check_embedding_dimension()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+DECLARE
+  expected_dims INTEGER;
+  actual_dims INTEGER;
+BEGIN
+  IF NEW.embedding IS NULL THEN
+    RETURN NEW;
+  END IF;
+  
+  SELECT dimensions INTO expected_dims
+  FROM embedding_models
+  WHERE id = NEW.embedding_model_id;
+  
+  IF expected_dims IS NULL THEN
+    RAISE EXCEPTION 'Embedding model % not found', NEW.embedding_model_id;
+  END IF;
+  
+  actual_dims := vector_dims(NEW.embedding);
+  
+  IF actual_dims != expected_dims THEN
+    RAISE EXCEPTION 'Embedding dimension mismatch for model %: expected %, got %',
+      NEW.embedding_model_id, expected_dims, actual_dims;
+  END IF;
+  
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER validate_embedding_dimension
+  BEFORE INSERT OR UPDATE ON embeddings
+  FOR EACH ROW
+  WHEN (NEW.embedding IS NOT NULL)
+  EXECUTE FUNCTION check_embedding_dimension();

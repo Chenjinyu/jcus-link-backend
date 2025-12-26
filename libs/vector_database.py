@@ -33,21 +33,13 @@ class VectorDatabase:
         self.openai_client = openai.OpenAI(api_key=openai_key) if openai_key else None
         self.ollama_url = ollama_url
         self._models_cache: Dict[str, EmbeddingModel] = {}
-        self._content_types_cache: Dict[str, str] = {}
         self._load_models()
-        self._load_content_types()
     
     def _load_models(self):
         """Load embedding models from database"""
         result = self.supabase.table('embedding_models').select('*').eq('is_active', True).execute()
         for model_data in result.data:
             self._models_cache[model_data['name']] = EmbeddingModel(**model_data)
-    
-    def _load_content_types(self):
-        """Load content types from database"""
-        result = self.supabase.table('content_types').select('*').execute()
-        for ct in result.data:
-            self._content_types_cache[ct['name']] = ct['id']
     
     # ========================================================================
     # EMBEDDING CREATION
@@ -56,7 +48,7 @@ class VectorDatabase:
     async def create_embedding(
         self, 
         text: str, 
-        model_name: str = 'nomic-embed-text'  # 768 dimenstions
+        model_name: str = 'nomic-embed-text-768'  # the name in embedding_models table
     ) -> List[float]:
         """Create embedding using specified model"""
         model = self._models_cache.get(model_name)
@@ -71,13 +63,14 @@ class VectorDatabase:
             raise ValueError(f"Provider {model.provider} not supported")
     
     async def _create_openai_embedding(self, text: str, model: EmbeddingModel) -> List[float]:
-        """Create OpenAI embedding"""
+        """Create OpenAI embedding with dimension reduction if needed"""
         if not self.openai_client:
             raise ValueError("OpenAI client not initialized. Provide openai_key in constructor.")
         
         response = self.openai_client.embeddings.create(
             model=model.model_identifier,
-            input=text
+            input=text,
+            dimensions=model.dimensions
         )
         return response.data[0].embedding
     
@@ -97,11 +90,9 @@ class VectorDatabase:
     # ========================================================================
     # DOCUMENT OPERATIONS
     # ========================================================================
-    
     async def add_document(
         self,
         user_id: str,
-        content_type: str,
         title: str,
         content: str,
         metadata: Dict = None,
@@ -116,7 +107,6 @@ class VectorDatabase:
         
         Args:
             user_id: User identifier
-            content_type: Type of content (must exist in content_types table)
             title: Document title
             content: Document content
             metadata: Optional metadata dictionary
@@ -128,11 +118,6 @@ class VectorDatabase:
         Returns:
             document_id: UUID of created document
         """
-        # Get content type ID
-        content_type_id = self._content_types_cache.get(content_type)
-        if not content_type_id:
-            raise ValueError(f"Content type '{content_type}' not found")
-        
         # Default to all active models
         if model_names is None:
             model_names = list(self._models_cache.keys())
@@ -140,7 +125,6 @@ class VectorDatabase:
         # Insert document
         doc_result = self.supabase.table('documents').insert({
             'user_id': user_id,
-            'content_type_id': content_type_id,
             'title': title,
             'content': content,
             'metadata': metadata or {},
@@ -282,7 +266,6 @@ class VectorDatabase:
     def get_documents(
         self,
         user_id: str,
-        content_type: Optional[str] = None,
         tags: Optional[List[str]] = None,
         limit: int = 100,
         offset: int = 0
@@ -292,7 +275,6 @@ class VectorDatabase:
         
         Args:
             user_id: User identifier
-            content_type: Filter by content type
             tags: Filter by tags (documents with ANY of these tags)
             limit: Maximum number of results
             offset: Offset for pagination
@@ -301,13 +283,8 @@ class VectorDatabase:
             List of documents
         """
         query = self.supabase.table('documents').select(
-            '*, content_types(name)'
+            '*'
         ).eq('user_id', user_id).eq('is_current', True).is_('deleted_at', 'null')
-        
-        if content_type:
-            content_type_id = self._content_types_cache.get(content_type)
-            if content_type_id:
-                query = query.eq('content_type_id', content_type_id)
         
         if tags:
             query = query.overlaps('tags', tags)
@@ -318,7 +295,6 @@ class VectorDatabase:
     # ========================================================================
     # ARTICLE OPERATIONS
     # ========================================================================
-    
     async def add_article(
         self,
         user_id: str,
@@ -329,6 +305,8 @@ class VectorDatabase:
         tags: List[str] = None,
         category: Optional[str] = None,
         status: str = 'draft',
+        seo_title: Optional[str] = None,
+        seo_description: Optional[str] = None,
         model_names: List[str] = None,
         chunk_size: int = 500
     ) -> Dict[str, str]:
@@ -341,10 +319,10 @@ class VectorDatabase:
         # Create document with embeddings
         document_id = await self.add_document(
             user_id=user_id,
-            content_type='article',
             title=title,
             content=content,
             tags=tags,
+            metadata={'source': 'article', 'category': category},
             model_names=model_names,
             chunk_size=chunk_size
         )
@@ -364,6 +342,8 @@ class VectorDatabase:
             'category': category,
             'status': status,
             'slug': slug,
+            'seo_title': seo_title,
+            'seo_description': seo_description,
             'published_at': datetime.now().isoformat() if status == 'published' else None
         }).execute()
         
@@ -382,6 +362,8 @@ class VectorDatabase:
         tags: Optional[List[str]] = None,
         category: Optional[str] = None,
         status: Optional[str] = None,
+        seo_title: Optional[str] = None,
+        seo_description: Optional[str] = None,
         recreate_embeddings: bool = True
     ) -> bool:
         """Update article and optionally recreate embeddings"""
@@ -411,6 +393,10 @@ class VectorDatabase:
             article_update['status'] = status
             if status == 'published' and 'published_at' not in article_update:
                 article_update['published_at'] = datetime.now().isoformat()
+        if seo_title is not None:
+            article_update['seo_title'] = seo_title
+        if seo_description is not None:
+            article_update['seo_description'] = seo_description
         
         self.supabase.table('articles').update(article_update).eq('id', article_id).execute()
         
@@ -466,62 +452,85 @@ class VectorDatabase:
     # ========================================================================
     # PROFILE DATA OPERATIONS
     # ========================================================================
-    
     async def add_profile_data(
         self,
         user_id: str,
-        category: Literal['work_experience', 'education', 'certification', 'skill', 'value', 'goal'],
+        category: Literal['work_experience', 'education', 'certification', 'skill', 'project', 'volunteer'],
         data: Dict,
         searchable: bool = True,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        is_current: bool = False,
+        is_featured: bool = False,
+        display_order: Optional[int] = None,
         model_names: List[str] = None
     ) -> Dict[str, str]:
         """
         Add profile data with optional document/embedding.
+        Note: searchable_text is auto-generated by trigger.
         
         Returns:
             Dict with 'profile_id' and optionally 'document_id'
         """
         result = {'profile_id': None, 'document_id': None}
         
-        # Create searchable text
-        searchable_text = self._flatten_dict_to_text(data)
-        
-        # Create document only if searchable
-        document_id = None
-        if searchable:
-            document_id = await self.add_document(
-                user_id=user_id,
-                content_type=category,
-                title=data.get('title', category),
-                content=searchable_text,
-                metadata={'profile_data': data},
-                model_names=model_names
-            )
-            result['document_id'] = document_id
-        
-        # Insert profile data
+        # Insert profile data first (trigger will generate searchable_text)
         profile_result = self.supabase.table('profile_data').insert({
             'user_id': user_id,
             'category': category,
             'data': data,
-            'document_id': document_id,
-            'searchable_text': searchable_text,
-            'start_date': data.get('start_date'),
-            'end_date': data.get('end_date'),
-            'is_current': data.get('current', True)
+            'start_date': start_date or data.get('start_date'),
+            'end_date': end_date or data.get('end_date'),
+            'is_current': is_current or data.get('current', False),
+            'is_featured': is_featured,
+            'display_order': display_order
         }).execute()
         
         result['profile_id'] = profile_result.data[0]['id']
+        
+        # Create document if searchable
+        if searchable:
+            # Get the generated searchable_text from trigger
+            profile = self.supabase.table('profile_data').select('searchable_text').eq(
+                'id', result['profile_id']
+            ).single().execute()
+            
+            searchable_text = profile.data['searchable_text']
+            
+            # Create document with embeddings
+            document_id = await self.add_document(
+                user_id=user_id,
+                title=data.get('title', category),
+                content=searchable_text,
+                metadata={'source': 'profile_data', 'category': category, 'profile_data': data},
+                tags=[category],
+                model_names=model_names
+            )
+            
+            # Link document to profile
+            self.supabase.table('profile_data').update({
+                'document_id': document_id
+            }).eq('id', result['profile_id']).execute()
+            
+            result['document_id'] = document_id
+        
         return result
     
     async def update_profile_data(
         self,
         profile_id: str,
         data: Optional[Dict] = None,
-        searchable: Optional[bool] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        is_current: Optional[bool] = None,
+        is_featured: Optional[bool] = None,
+        display_order: Optional[int] = None,
         recreate_embeddings: bool = True
     ) -> bool:
-        """Update profile data and optionally recreate embeddings"""
+        """
+        Update profile data and optionally recreate embeddings.
+        Note: searchable_text is auto-updated by trigger.
+        """
         # Get current profile
         profile = self.supabase.table('profile_data').select('*').eq('id', profile_id).single().execute()
         
@@ -530,23 +539,39 @@ class VectorDatabase:
         
         current_data = profile.data
         
-        # Update data
+        # Build update
+        update_data = {}
         if data:
             updated_data = {**current_data['data'], **data}
-            searchable_text = self._flatten_dict_to_text(updated_data)
+            update_data['data'] = updated_data
+        if start_date is not None:
+            update_data['start_date'] = start_date
+        if end_date is not None:
+            update_date['end_date'] = end_date
+        if is_current is not None:
+            update_data['is_current'] = is_current
+        if is_featured is not None:
+            update_data['is_featured'] = is_featured
+        if display_order is not None:
+            update_data['display_order'] = display_order
+        
+        # Update profile data (trigger will update searchable_text)
+        self.supabase.table('profile_data').update(update_data).eq('id', profile_id).execute()
+        
+        # Update document if exists
+        if current_data['document_id'] and recreate_embeddings and data:
+            # Get updated searchable_text from trigger
+            updated_profile = self.supabase.table('profile_data').select(
+                'searchable_text'
+            ).eq('id', profile_id).single().execute()
             
-            self.supabase.table('profile_data').update({
-                'data': updated_data,
-                'searchable_text': searchable_text
-            }).eq('id', profile_id).execute()
+            searchable_text = updated_profile.data['searchable_text']
             
-            # Update document if exists
-            if current_data['document_id'] and recreate_embeddings:
-                await self.update_document(
-                    document_id=current_data['document_id'],
-                    content=searchable_text,
-                    recreate_embeddings=True
-                )
+            await self.update_document(
+                document_id=current_data['document_id'],
+                content=searchable_text,
+                recreate_embeddings=True
+            )
         
         return True
     
@@ -574,6 +599,7 @@ class VectorDatabase:
         user_id: str,
         category: Optional[str] = None,
         is_current: Optional[bool] = None,
+        is_featured: Optional[bool] = None,
         limit: int = 100,
         offset: int = 0
     ) -> List[Dict]:
@@ -584,14 +610,15 @@ class VectorDatabase:
             query = query.eq('category', category)
         if is_current is not None:
             query = query.eq('is_current', is_current)
+        if is_featured is not None:
+            query = query.eq('is_featured', is_featured)
         
-        result = query.order('created_at', desc=True).limit(limit).range(offset, offset + limit - 1).execute()
+        result = query.order('display_order', desc=False).order('created_at', desc=True).limit(limit).range(offset, offset + limit - 1).execute()
         return result.data
     
     # ========================================================================
     # PERSONAL ATTRIBUTES OPERATIONS
     # ========================================================================
-    
     async def add_personal_attribute(
         self,
         user_id: str,
@@ -608,43 +635,20 @@ class VectorDatabase:
     ) -> Dict[str, str]:
         """
         Add personal attribute with optional document/embedding.
+        Note: searchable_text is auto-generated by trigger.
         
         Returns:
             Dict with 'attribute_id' and optionally 'document_id'
         """
         result = {'attribute_id': None, 'document_id': None}
         
-        # Build searchable text
-        searchable_text = f"{title}. {description}"
-        if examples:
-            searchable_text += ". Examples: " + ". ".join(examples)
-        
-        # Create document only if searchable
-        document_id = None
-        if searchable:
-            document_id = await self.add_document(
-                user_id=user_id,
-                content_type=attribute_type,
-                title=title,
-                content=searchable_text,
-                metadata={
-                    'attribute_type': attribute_type,
-                    'importance_score': importance_score,
-                    'confidence_level': confidence_level
-                },
-                model_names=model_names
-            )
-            result['document_id'] = document_id
-        
-        # Insert personal attribute
+        # Insert personal attribute first (trigger will generate searchable_text)
         attr_result = self.supabase.table('personal_attributes').insert({
             'user_id': user_id,
-            'document_id': document_id,
             'attribute_type': attribute_type,
             'title': title,
             'description': description,
             'examples': examples or [],
-            'searchable_text': searchable_text,
             'importance_score': importance_score,
             'confidence_level': confidence_level,
             'related_articles': related_articles or [],
@@ -652,6 +656,38 @@ class VectorDatabase:
         }).execute()
         
         result['attribute_id'] = attr_result.data[0]['id']
+        
+        # Create document if searchable
+        if searchable:
+            # Get the generated searchable_text from trigger
+            attr = self.supabase.table('personal_attributes').select('searchable_text').eq(
+                'id', result['attribute_id']
+            ).single().execute()
+            
+            searchable_text = attr.data['searchable_text']
+            
+            # Create document with embeddings
+            document_id = await self.add_document(
+                user_id=user_id,
+                title=title,
+                content=searchable_text,
+                metadata={
+                    'source': 'personal_attribute',
+                    'attribute_type': attribute_type,
+                    'importance_score': importance_score,
+                    'confidence_level': confidence_level
+                },
+                tags=[attribute_type],
+                model_names=model_names
+            )
+            
+            # Link document to attribute
+            self.supabase.table('personal_attributes').update({
+                'document_id': document_id
+            }).eq('id', result['attribute_id']).execute()
+            
+            result['document_id'] = document_id
+        
         return result
     
     async def update_personal_attribute(
@@ -666,7 +702,10 @@ class VectorDatabase:
         related_experiences: Optional[List[str]] = None,
         recreate_embeddings: bool = True
     ) -> bool:
-        """Update personal attribute and optionally recreate embeddings"""
+        """
+        Update personal attribute and optionally recreate embeddings.
+        Note: searchable_text is auto-updated by trigger.
+        """
         # Get current attribute
         attr = self.supabase.table('personal_attributes').select('*').eq('id', attribute_id).single().execute()
         
@@ -692,32 +731,25 @@ class VectorDatabase:
         if related_experiences is not None:
             update_data['related_experiences'] = related_experiences
         
-        # Update personal_attributes
+        # Update personal_attributes (trigger will update searchable_text)
         self.supabase.table('personal_attributes').update(update_data).eq('id', attribute_id).execute()
         
         # Update document if exists and content changed
-        if current['document_id'] and (title is not None or description is not None or examples is not None):
-            # Get updated attribute
-            updated_attr = self.supabase.table('personal_attributes').select('*').eq('id', attribute_id).single().execute()
-            attr_data = updated_attr.data
+        if current['document_id'] and recreate_embeddings and (title or description or examples):
+            # Get updated searchable_text from trigger
+            updated_attr = self.supabase.table('personal_attributes').select(
+                'searchable_text', 'title'
+            ).eq('id', attribute_id).single().execute()
             
-            # Build new searchable text
-            new_searchable_text = f"{attr_data['title']}. {attr_data['description']}"
-            if attr_data['examples']:
-                new_searchable_text += ". Examples: " + ". ".join(attr_data['examples'])
+            searchable_text = updated_attr.data['searchable_text']
+            new_title = updated_attr.data['title']
             
-            # Update document
             await self.update_document(
                 document_id=current['document_id'],
-                title=attr_data['title'],
-                content=new_searchable_text,
-                recreate_embeddings=recreate_embeddings
+                title=new_title,
+                content=searchable_text,
+                recreate_embeddings=True
             )
-            
-            # Update searchable_text
-            self.supabase.table('personal_attributes').update({
-                'searchable_text': new_searchable_text
-            }).eq('id', attribute_id).execute()
         
         return True
     
@@ -744,6 +776,7 @@ class VectorDatabase:
         self,
         user_id: str,
         attribute_type: Optional[str] = None,
+        min_importance: Optional[int] = None,
         limit: int = 100,
         offset: int = 0
     ) -> List[Dict]:
@@ -752,145 +785,13 @@ class VectorDatabase:
         
         if attribute_type:
             query = query.eq('attribute_type', attribute_type)
+        if min_importance is not None:
+            query = query.gte('importance_score', min_importance)
         
-        result = query.order('created_at', desc=True).limit(limit).range(offset, offset + limit - 1).execute()
+        result = query.order('importance_score', desc=True).order('created_at', desc=True).limit(limit).range(offset, offset + limit - 1).execute()
         return result.data
     
-    # ------------------ Semantic Search to Find Matching Documents ------------------
-    async def smart_update(
-        self,
-        user_id: str,
-        update_description: str,
-        new_content: str,
-        content_type: Optional[str] = None,
-        similarity_threshold: float = 0.85,
-        model_name: str = 'nomic-embed-text'  # 768 dimenstions
-    ) -> Dict[str, any]:
-        """
-        Intelligently find and update documents based on semantic similarity.
-        
-        Args:
-            user_id: User identifier
-            update_description: Natural language description of what to update
-                                e.g., "Update my current job information"
-            new_content: The new/updated content
-            content_type: Optional filter by content type
-            similarity_threshold: How similar content must be to match (0-1)
-            model_name: Embedding model to use
-            
-        Returns:
-            Dict with update results and matched documents
-        """
-        # Step 1: Find matching documents using semantic search
-        matches = await self.search(
-            query=update_description,
-            user_id=user_id,
-            content_types=[content_type] if content_type else None,
-            threshold=similarity_threshold,
-            limit=3,  # Get top 3 matches
-            model_name=model_name
-        )
-        
-        if not matches:
-            return {
-                'success': False,
-                'message': 'No matching documents found',
-                'matches': []
-            }
-        
-        # Step 2: Determine best match
-        best_match = matches[0]
-        document_id = best_match['document_id']
-        
-        # Step 3: Get full document details
-        document = self.get_document(document_id)
-        
-        # Step 4: Determine update strategy based on content type
-        update_result = await self._apply_smart_update(
-            document=document,
-            best_match=best_match,
-            new_content=new_content
-        )
-        
-        return {
-            'success': True,
-            'matched_document_id': document_id,
-            'similarity': best_match['similarity'],
-            'content_type': best_match['content_type'],
-            'article_id': best_match.get('article_id'),
-            'profile_data_id': best_match.get('profile_data_id'),
-            'personal_attribute_id': best_match.get('personal_attribute_id'),
-            'update_result': update_result,
-            'all_matches': matches  # Return all matches for user confirmation
-        }
     
-    async def _apply_smart_update(
-        self,
-        document: Dict,
-        best_match: Dict,
-        new_content: str
-    ) -> Dict:
-        """Apply update to the appropriate table based on match type"""
-        
-        # Update article
-        if best_match.get('article_id'):
-            await self.update_article(
-                article_id=best_match['article_id'],
-                content=new_content,
-                recreate_embeddings=True
-            )
-            return {'type': 'article', 'id': best_match['article_id']}
-        
-        # Update profile data
-        elif best_match.get('profile_data_id'):
-            # Parse new content and merge with existing data
-            profile = self.get_profile_data(best_match['profile_data_id'])
-            updated_data = self._merge_profile_data(profile['data'], new_content)
-            
-            await self.update_profile_data(
-                profile_id=best_match['profile_data_id'],
-                data=updated_data,
-                recreate_embeddings=True
-            )
-            return {'type': 'profile_data', 'id': best_match['profile_data_id']}
-        
-        # Update personal attribute
-        elif best_match.get('personal_attribute_id'):
-            await self.update_personal_attribute(
-                attribute_id=best_match['personal_attribute_id'],
-                description=new_content,
-                recreate_embeddings=True
-            )
-            return {'type': 'personal_attribute', 'id': best_match['personal_attribute_id']}
-        
-        # Update document directly
-        else:
-            await self.update_document(
-                document_id=document['id'],
-                content=new_content,
-                recreate_embeddings=True
-            )
-            return {'type': 'document', 'id': document['id']}
-    
-    def _merge_profile_data(self, existing_data: Dict, new_content: str) -> Dict:
-        """
-        Merge new content with existing profile data.
-        Uses AI to extract structured updates from natural language.
-        """
-        # Simple merge - update description field
-        # In production, you'd use AI to parse new_content into structured data
-        updated_data = existing_data.copy()
-        
-        # Try to intelligently update based on keywords
-        if 'description' in updated_data:
-            updated_data['description'] = new_content
-        elif 'details' in updated_data:
-            updated_data['details'] = new_content
-        else:
-            # Add as new field
-            updated_data['updated_info'] = new_content
-        
-        return updated_data
     
     # ========================================================================
     # AI-ASSISTED UPDATE (USE LLM TO PARSE INTENT)
@@ -1005,175 +906,219 @@ class VectorDatabase:
             pass
         
         return None
-    # ------------------ BATCH UPDATE WITH CONFIRMATION ------------------
     
-    async def detect_changes(
+    # ========================================================================
+    # SEARCH OPERATIONS (Using SQL Functions)
+    # ========================================================================
+    async def search(
+        self,
+        query: str,
+        user_id: str,
+        content_types: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        threshold: float = 0.7,
+        limit: int = 10,
+        model_name: str = 'ollama-nomic'  # 768 dimensions
+    ) -> List[Dict]:
+        """
+        Search across all content using vector similarity.
+        Uses the search_documents SQL function.
+        
+        Args:
+            query: Search query text
+            user_id: User identifier
+            content_types: Filter by content types (e.g., ['article', 'work_experience'])
+            tags: Filter by tags
+            threshold: Minimum similarity threshold (0-1)
+            limit: Maximum number of results
+            model_name: Embedding model to use
+            
+        Returns:
+            List of search results with similarity scores
+        """
+        # Create query embedding
+        query_embedding = await self.create_embedding(query, model_name)
+        
+        # Get model ID
+        model = self._models_cache.get(model_name)
+        if not model:
+            raise ValueError(f"Model {model_name} not found")
+        
+        # Search using database function
+        results = self.supabase.rpc('search_documents', {
+            'query_embedding': query_embedding,
+            'model_id': model.id,
+            'match_threshold': threshold,
+            'match_count': limit,
+            'filter_user_id': user_id,
+            'filter_content_types': content_types,
+            'filter_tags': tags
+        }).execute()
+        
+        return results.data
+    
+    async def search_all(
+        self,
+        query: str,
+        user_id: str,
+        threshold: float = 0.7,
+        limit: int = 10,
+        model_name: str = 'ollama-nomic'  # 768 dimensions
+    ) -> List[Dict]:
+        """
+        Simplified search across all content.
+        Uses the search_all_content SQL function.
+        
+        Args:
+            query: Search query text
+            user_id: User identifier
+            threshold: Minimum similarity threshold (0-1)
+            limit: Maximum number of results
+            model_name: Embedding model to use
+            
+        Returns:
+            List of search results with similarity scores
+        """
+        # Create query embedding
+        query_embedding = await self.create_embedding(query, model_name)
+        
+        # Search using database function
+        results = self.supabase.rpc('search_all_content', {
+            'query_embedding': query_embedding,
+            'user_id_filter': user_id,
+            'match_threshold': threshold,
+            'match_count': limit
+        }).execute()
+        
+        return results.data
+    
+    # ========================================================================
+    # SMART UPDATE OPERATIONS
+    # ========================================================================
+    
+    async def smart_update(
         self,
         user_id: str,
-        new_information: str,
-        model_name: str = 'nomic-embed-text'  # 768 dimenstions
-    ) -> Dict:
+        update_description: str,
+        new_content: str,
+        content_type: Optional[str] = None,
+        similarity_threshold: float = 0.85,
+        model_name: str = 'ollama-nomic'
+    ) -> Dict[str, any]:
         """
-        Detect what information changed by comparing with existing content.
+        Intelligently find and update documents based on semantic similarity.
         
         Args:
             user_id: User identifier
-            new_information: New information from AI conversation
+            update_description: Natural language description of what to update
+            new_content: The new/updated content
+            content_type: Optional filter by content type
+            similarity_threshold: How similar content must be to match (0-1)
+            model_name: Embedding model to use
             
         Returns:
-            Dict with detected changes and affected documents
+            Dict with update results and matched documents
         """
-        # Step 1: Search for related existing content
-        related = await self.search(
-            query=new_information,
+        # Find matching documents
+        matches = await self.search(
+            query=update_description,
             user_id=user_id,
-            threshold=0.7,
-            limit=10,
+            content_types=[content_type] if content_type else None,
+            threshold=similarity_threshold,
+            limit=3,
             model_name=model_name
         )
         
-        # Step 2: Use AI to detect what changed
-        changes = await self._detect_semantic_changes(
-            new_information=new_information,
-            existing_content=related
+        if not matches:
+            return {
+                'success': False,
+                'message': 'No matching documents found',
+                'matches': []
+            }
+        
+        # Determine best match
+        best_match = matches[0]
+        document_id = best_match['document_id']
+        
+        # Get full document details
+        document = self.get_document(document_id)
+        
+        # Apply update based on content type
+        update_result = await self._apply_smart_update(
+            document=document,
+            best_match=best_match,
+            new_content=new_content
         )
         
         return {
-            'new_information': new_information,
-            'detected_changes': changes,
-            'affected_documents': related
+            'success': True,
+            'matched_document_id': document_id,
+            'similarity': best_match['similarity'],
+            'content_type': best_match['content_type'],
+            'article_id': best_match.get('article_id'),
+            'profile_data_id': best_match.get('profile_data_id'),
+            'personal_attribute_id': best_match.get('personal_attribute_id'),
+            'update_result': update_result,
+            'all_matches': matches
         }
     
-    async def _detect_semantic_changes(
+    async def _apply_smart_update(
         self,
-        new_information: str,
-        existing_content: List[Dict]
-    ) -> List[Dict]:
-        """
-        Use AI to detect what specifically changed.
-        """
-        if not self.openai_client or not existing_content:
-            return []
+        document: Dict,
+        best_match: Dict,
+        new_content: str
+    ) -> Dict:
+        """Apply update to the appropriate table based on match type"""
         
-        # Build comparison prompt
-        existing_text = "\n\n".join([
-            f"[{c['content_type']}] {c['title']}: {c['chunk_text'][:200]}"
-            for c in existing_content[:5]
-        ])
-        
-        system_prompt = """
-        Compare new information with existing content and identify changes.
-        
-        Return JSON array of changes:
-        [
-            {
-                "change_type": "update|add|contradiction",
-                "field": "what changed (e.g., job_title, skill_level)",
-                "old_value": "previous value",
-                "new_value": "new value",
-                "affected_content_type": "work_experience|skill|etc",
-                "confidence": 0.0-1.0
-            }
-        ]
-        """
-        
-        user_prompt = f"""
-        New Information:
-        {new_information}
-        
-        Existing Content:
-        {existing_text}
-        
-        What changed?
-        """
-        
-        response = self.openai_client.chat.completions.create(
-            model='gpt-4',
-            messages=[
-                {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': user_prompt}
-            ],
-            response_format={'type': 'json_object'}
-        )
-        
-        try:
-            result = json.loads(response.choices[0].message.content)
-            return result.get('changes', [])
-        except:
-            return []
-    
-    async def apply_detected_changes(
-        self,
-        user_id: str,
-        changes: List[Dict],
-        auto_apply: bool = False
-    ) -> List[Dict]:
-        """
-        Apply detected changes to database.
-        
-        Args:
-            user_id: User identifier
-            changes: List of detected changes
-            auto_apply: If True, applies without confirmation
-            
-        Returns:
-            List of applied updates
-        """
-        applied = []
-        
-        for change in changes:
-            if change.get('confidence', 0) < 0.8 and not auto_apply:
-                continue  # Skip low-confidence changes unless auto_apply
-            
-            # Find affected document
-            content_type = change.get('affected_content_type')
-            search_query = f"{change.get('field')} {change.get('old_value', '')}"
-            
-            matches = await self.search(
-                query=search_query,
-                user_id=user_id,
-                content_types=[content_type] if content_type else None,
-                threshold=0.85,
-                limit=1
+        # Update article
+        if best_match.get('article_id'):
+            await self.update_article(
+                article_id=best_match['article_id'],
+                content=new_content,
+                recreate_embeddings=True
             )
-            
-            if matches:
-                # Apply update
-                result = await self.smart_update(
-                    user_id=user_id,
-                    update_description=search_query,
-                    new_content=change.get('new_value', ''),
-                    content_type=content_type
-                )
-                
-                applied.append({
-                    'change': change,
-                    'update_result': result
-                })
+            return {'type': 'article', 'id': best_match['article_id']}
         
-        return applied
+        # Update profile data
+        elif best_match.get('profile_data_id'):
+            profile = self.get_profile_data(best_match['profile_data_id'])
+            updated_data = self._merge_profile_data(profile['data'], new_content)
+            
+            await self.update_profile_data(
+                profile_id=best_match['profile_data_id'],
+                data=updated_data,
+                recreate_embeddings=True
+            )
+            return {'type': 'profile_data', 'id': best_match['profile_data_id']}
+        
+        # Update personal attribute
+        elif best_match.get('personal_attribute_id'):
+            await self.update_personal_attribute(
+                attribute_id=best_match['personal_attribute_id'],
+                description=new_content,
+                recreate_embeddings=True
+            )
+            return {'type': 'personal_attribute', 'id': best_match['personal_attribute_id']}
+        
+        # Update document directly
+        else:
+            await self.update_document(
+                document_id=document['id'],
+                content=new_content,
+                recreate_embeddings=True
+            )
+            return {'type': 'document', 'id': document['id']}
     
-    # ========================================================================
-    # BATCH UPDATE WITH CONFIRMATION
-    # ========================================================================
     async def propose_updates(
         self,
         user_id: str,
         update_request: str,
-        model_name: str = 'nomic-embed-text'  # 768 dimenstions
+        model_name: str = 'ollama-nomic'
     ) -> List[Dict]:
         """
         Find potential updates but don't apply them yet.
         Returns proposals for user confirmation.
-        
-        Args:
-            user_id: User identifier
-            update_request: Natural language update request
-            
-        Returns:
-            List of proposed updates with match details
         """
-        # Find matching documents
         matches = await self.search(
             query=update_request,
             user_id=user_id,
@@ -1207,10 +1152,8 @@ class VectorDatabase:
         profile_data_id: Optional[str] = None,
         personal_attribute_id: Optional[str] = None
     ) -> bool:
-        """
-        Apply a confirmed update after user approval.
-        """
-        # Update based on type
+        """Apply a confirmed update after user approval"""
+        
         if article_id:
             await self.update_article(
                 article_id=article_id,
@@ -1241,55 +1184,6 @@ class VectorDatabase:
         return True
     
     # ========================================================================
-    # SEARCH OPERATIONS
-    # ========================================================================
-    async def search(
-        self,
-        query: str,
-        user_id: str,
-        content_types: Optional[List[str]] = None,
-        tags: Optional[List[str]] = None,
-        threshold: float = 0.7,
-        limit: int = 10,
-        model_name: str = 'nomic-embed-text'  # 768 dimenstions
-    ) -> List[Dict]:
-        """
-        Search across all content using vector similarity.
-        
-        Args:
-            query: Search query text
-            user_id: User identifier
-            content_types: Filter by content types
-            tags: Filter by tags
-            threshold: Minimum similarity threshold (0-1)
-            limit: Maximum number of results
-            model_name: Embedding model to use
-            
-        Returns:
-            List of search results with similarity scores
-        """
-        # Create query embedding
-        query_embedding = await self.create_embedding(query, model_name)
-        
-        # Get model ID
-        model = self._models_cache.get(model_name)
-        if not model:
-            raise ValueError(f"Model {model_name} not found")
-        
-        # Search using database function
-        results = self.supabase.rpc('search_documents', {
-            'query_embedding': query_embedding,
-            'model_id': model.id,
-            'match_threshold': threshold,
-            'match_count': limit,
-            'filter_user_id': user_id,
-            'filter_content_types': content_types,
-            'filter_tags': tags
-        }).execute()
-        
-        return results.data
-    
-    # ========================================================================
     # HELPER METHODS
     # ========================================================================
     
@@ -1302,7 +1196,6 @@ class VectorDatabase:
         """Split text into overlapping chunks"""
         words = text.split()
         
-        # If text is short enough, return as single chunk
         if len(words) <= chunk_size:
             return [text]
         
@@ -1326,10 +1219,23 @@ class VectorDatabase:
                 parts.append(f"{key}: {self._flatten_dict_to_text(value)}")
         return '. '.join(parts)
     
+    def _merge_profile_data(self, existing_data: Dict, new_content: str) -> Dict:
+        """Merge new content with existing profile data"""
+        updated_data = existing_data.copy()
+        
+        if 'description' in updated_data:
+            updated_data['description'] = new_content
+        elif 'details' in updated_data:
+            updated_data['details'] = new_content
+        else:
+            updated_data['updated_info'] = new_content
+        
+        return updated_data
+    
     def _create_slug(self, title: str) -> str:
         """Create URL-friendly slug from title"""
         import re
         slug = title.lower()
         slug = re.sub(r'[^a-z0-9]+', '-', slug)
         slug = slug.strip('-')
-        return slug[:100]  # Limit length
+        return slug[:100]
