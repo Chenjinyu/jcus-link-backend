@@ -1,12 +1,13 @@
 # vector_database.py
+import json
+import httpx
+import asyncpg
 from typing import List, Dict, Optional, Union, Literal
 from dataclasses import dataclass
 from supabase import create_client, Client
+from datetime import datetime, date
 import openai
-from datetime import datetime
-import httpx
-import json
-import asyncpg
+
 try:
     import google as genai
     GOOGLE_AVAILABLE = True
@@ -22,7 +23,6 @@ class EmbeddingModel:
     model_identifier: str
     dimensions: int
     is_local: bool
-    is_available: bool = False
     cost_per_token: Optional[float] = None
 
 class VectorDatabase:
@@ -34,9 +34,9 @@ class VectorDatabase:
     """
     
     def __init__(
-        self,
-        supabase_url: str,
-        supabase_key: str,
+        self, 
+        supabase_url: str, 
+        supabase_key: str, 
         postgres_url: str,
         openai_key: Optional[str] = None,
         google_key: Optional[str] = None,
@@ -68,8 +68,11 @@ class VectorDatabase:
                 self.postgres_url,
                 min_size=2,
                 max_size=10,
-                command_timeout=60
+                command_timeout=60,
+                statement_cache_size=0 # Disable prepared statement caching.
             )
+            # Fix profile_data trigger if needed (disable searchable_text assignment)
+            await self._fix_profile_data_trigger()
 
     async def close_pool(self):
         """Close PostgreSQL connection pool."""
@@ -77,20 +80,134 @@ class VectorDatabase:
             await self.pg_pool.close()
             self.pg_pool = None
     
+    async def _fix_profile_data_trigger(self):
+        """
+        Fix profile_data trigger to not set searchable_text (column doesn't exist).
+        This is a one-time fix that runs when pool is initialized.
+        """
+        try:
+            async with self.pg_pool.acquire() as conn:
+                # Drop and recreate trigger function as no-op
+                await conn.execute("""
+                    DROP TRIGGER IF EXISTS update_profile_data_searchable_text_trigger ON profile_data;
+                    DROP FUNCTION IF EXISTS update_profile_data_searchable_text();
+                    
+                    CREATE OR REPLACE FUNCTION update_profile_data_searchable_text()
+                    RETURNS TRIGGER
+                    LANGUAGE plpgsql
+                    SET search_path = public
+                    AS $$
+                    BEGIN
+                      -- No-op: searchable_text is generated in Python, not by trigger
+                      RETURN NEW;
+                    END;
+                    $$;
+                    
+                    CREATE TRIGGER update_profile_data_searchable_text_trigger
+                      BEFORE INSERT OR UPDATE ON profile_data
+                      FOR EACH ROW
+                      EXECUTE FUNCTION update_profile_data_searchable_text();
+                """)
+        except Exception as e:
+            # If trigger fix fails, log but don't fail initialization
+            print(f"Warning: Could not fix profile_data trigger: {e}")
+            print("You may need to run the SQL migration manually: db_migration/supabase/fix_profile_data_trigger.sql")
+    
+    def _parse_date(self, date_value: Optional[Union[str, date]]) -> Optional[date]:
+        """
+        Convert string date to Python date object for asyncpg.
+        
+        Args:
+            date_value: String in 'YYYY-MM-DD' format or date object or None
+            
+        Returns:
+            date object or None
+        """
+        if date_value is None:
+            return None
+        if isinstance(date_value, date):
+            return date_value
+        if isinstance(date_value, str):
+            # Parse 'YYYY-MM-DD' format
+            try:
+                return datetime.strptime(date_value, '%Y-%m-%d').date()
+            except ValueError:
+                # Try other common formats
+                try:
+                    return datetime.strptime(date_value, '%Y/%m/%d').date()
+                except ValueError:
+                    raise ValueError(f"Invalid date format: {date_value}. Expected 'YYYY-MM-DD' or 'YYYY/MM/DD'")
+        raise TypeError(f"date_value must be str, date, or None, got {type(date_value)}")
+    
+    def _generate_searchable_text_from_profile_data(self, data: Dict) -> str:
+        """
+        Generate searchable text from profile_data JSONB data.
+        Replicates the logic from update_profile_data_searchable_text() trigger.
+        
+        Args:
+            data: Profile data dictionary
+            
+        Returns:
+            Searchable text string
+        """
+        text_parts = []
+        
+        if 'title' in data:
+            text_parts.append(str(data['title']))
+        
+        if 'company' in data:
+            text_parts.append(str(data['company']))
+        
+        if 'position' in data:
+            text_parts.append(str(data['position']))
+        
+        if 'description' in data:
+            text_parts.append(str(data['description']))
+        
+        if 'skills' in data:
+            skills = data['skills']
+            if isinstance(skills, list):
+                text_parts.append('Skills: ' + ', '.join(map(str, skills)))
+            else:
+                text_parts.append('Skills: ' + str(skills))
+        
+        if 'achievements' in data:
+            achievements = data['achievements']
+            if isinstance(achievements, list):
+                text_parts.append('. '.join(map(str, achievements)))
+            else:
+                text_parts.append(str(achievements))
+        
+        if 'responsibilities' in data:
+            responsibilities = data['responsibilities']
+            if isinstance(responsibilities, list):
+                text_parts.append('. '.join(map(str, responsibilities)))
+            else:
+                text_parts.append(str(responsibilities))
+        
+        # Add other common fields
+        for key in ['institution', 'degree', 'field_of_study', 'name', 'level']:
+            if key in data:
+                text_parts.append(str(data[key]))
+        
+        return '. '.join(text_parts) if text_parts else ''
+    
     def _load_models(self):
-        """Load embedding models from database"""
+        """Load embedding models from database and set availability based on client initialization"""
         result = self.supabase.table('embedding_models').select('*').eq('is_active', True).execute()
         for model_data in result.data:
             provider = model_data['provider']
             if provider not in ['openai', 'ollama', 'google']:
                 raise ValueError(f"Unsupported provider: {provider}")
-            if provider == 'openai' and self.openai_client:
-                model_data['is_available'] = True
-            if provider == 'ollama' and self.ollama_url:
-                model_data['is_available'] = True
-            if provider == 'google' and self.google_client:
-                model_data['is_available'] = True
-                    
+
+            # Determine availability based on provider and client initialization
+            if provider == 'openai' and self.openai_client is None:
+                continue
+            elif provider == 'ollama' and self.ollama_url is None:
+                continue
+            elif provider == 'google' and self.google_client is None:
+                continue
+
             self._models_cache[model_data['name']] = EmbeddingModel(
                 id=model_data['id'],
                 name=model_data['name'],
@@ -98,9 +215,10 @@ class VectorDatabase:
                 model_identifier=model_data['model_identifier'],
                 dimensions=model_data['dimensions'],
                 is_local=model_data['is_local'],
-                is_available=model_data.get('is_available', False),
                 cost_per_token=model_data.get('cost_per_token')
             )
+        print("--"*20)
+        print(self._models_cache)
     
     # ========================================================================
     # EMBEDDING CREATION - MULTI-PROVIDER
@@ -118,9 +236,6 @@ class VectorDatabase:
         model = self._models_cache.get(model_name)
         if not model:
             raise ValueError(f"Model {model_name} not found or not active")
-        
-        if model.is_available == False:
-            raise ValueError(f"Model {model_name} is not available. Check provider configuration.")
         
         if model.provider == 'openai':
             return await self._create_openai_embedding(text, model)
@@ -193,10 +308,10 @@ class VectorDatabase:
 
         if model_names is None:
             model_names = list(self._models_cache.keys())
-
+        
         chunks = self._chunk_text(content, chunk_size, chunk_overlap)
         total_chunks = len(chunks)
-
+        
         async with self.pg_pool.acquire() as conn:
             async with conn.transaction():
                 # Insert document
@@ -210,22 +325,24 @@ class VectorDatabase:
                 )
 
                 # Create and insert embeddings for each model
-                for model_name in model_names:
-                    model = self._models_cache[model_name]
+        for model_name in model_names:
+            model = self._models_cache[model_name]
+            
+            for chunk_index, chunk_text in enumerate(chunks):
+                embedding = await self.create_embedding(chunk_text, model_name)
+                # Convert list to pgvector format: '[0.1, 0.2, ...]'
+                embedding_str = '[' + ','.join(map(str, embedding)) + ']'
 
-                    for chunk_index, chunk_text in enumerate(chunks):
-                        embedding = await self.create_embedding(chunk_text, model_name)
-
-                        await conn.execute(
-                            """
-                            INSERT INTO embeddings
-                            (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                            VALUES ($1, $2, $3, $4, $5, $6)
-                            """,
-                            document_id, model.id, embedding, chunk_text, chunk_index, total_chunks
-                        )
-
-                return document_id
+                await conn.execute(
+                    """
+                    INSERT INTO embeddings
+                    (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
+                    VALUES ($1, $2, $3::vector, $4, $5, $6)
+                    """,
+                    document_id, model.id, embedding_str, chunk_text, chunk_index, total_chunks
+                )
+        
+        return document_id
     
     async def update_document(
         self,
@@ -281,7 +398,7 @@ class VectorDatabase:
                         """,
                         *params
                     )
-
+        
                 # Recreate embeddings if content changed
                 if recreate_embeddings and content is not None:
                     # Get existing embedding model IDs
@@ -290,37 +407,39 @@ class VectorDatabase:
                         document_id
                     )
                     model_ids = [row['embedding_model_id'] for row in existing]
-
+            
                     # Delete old embeddings
                     await conn.execute(
                         "DELETE FROM embeddings WHERE document_id = $1",
                         document_id
                     )
-
+            
                     # Create new embeddings
-                    chunks = self._chunk_text(content, chunk_size, chunk_overlap)
-                    total_chunks = len(chunks)
+                chunks = self._chunk_text(content, chunk_size, chunk_overlap)
+                total_chunks = len(chunks)
+                
+                for model_id in model_ids:
+                    model_name = next(
+                        (name for name, m in self._models_cache.items() if m.id == model_id),
+                        None
+                    )
+                    
+                    if model_name:
+                        for chunk_index, chunk_text in enumerate(chunks):
+                            embedding = await self.create_embedding(chunk_text, model_name)
+                            # Convert list to pgvector format: '[0.1, 0.2, ...]' when using raw sql.
+                            embedding_str = '[' + ','.join(map(str, embedding)) + ']'
 
-                    for model_id in model_ids:
-                        model_name = next(
-                            (name for name, m in self._models_cache.items() if m.id == model_id),
-                            None
-                        )
-
-                        if model_name:
-                            for chunk_index, chunk_text in enumerate(chunks):
-                                embedding = await self.create_embedding(chunk_text, model_name)
-
-                                await conn.execute(
-                                    """
-                                    INSERT INTO embeddings
-                                    (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                                    VALUES ($1, $2, $3, $4, $5, $6)
-                                    """,
-                                    document_id, model_id, embedding, chunk_text, chunk_index, total_chunks
-                                )
-
-                return True
+                            await conn.execute(
+                                """
+                                INSERT INTO embeddings
+                                (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
+                                VALUES ($1, $2, $3::vector, $4, $5, $6)
+                                """,
+                                document_id, model_id, embedding_str, chunk_text, chunk_index, total_chunks
+                            )
+        
+        return True
     
     def delete_document(self, document_id: str, soft_delete: bool = True) -> bool:
         """Delete document (soft or hard delete)"""
@@ -421,10 +540,12 @@ class VectorDatabase:
 
         chunks = self._chunk_text(content, chunk_size, chunk_overlap)
         total_chunks = len(chunks)
-        slug = self._create_slug(title)
 
         async with self.pg_pool.acquire() as conn:
             async with conn.transaction():
+                # Generate unique slug (check for duplicates within transaction)
+                slug = await self._create_unique_slug(title, conn, user_id)
+                
                 # Insert document
                 document_id = await conn.fetchval(
                     """
@@ -443,14 +564,16 @@ class VectorDatabase:
 
                     for chunk_index, chunk_text in enumerate(chunks):
                         embedding = await self.create_embedding(chunk_text, model_name)
+                        # Convert list to pgvector format: '[0.1, 0.2, ...]'
+                        embedding_str = '[' + ','.join(map(str, embedding)) + ']'
 
                         await conn.execute(
                             """
                             INSERT INTO embeddings
                             (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                            VALUES ($1, $2, $3, $4, $5, $6)
+                            VALUES ($1, $2, $3::vector, $4, $5, $6)
                             """,
-                            document_id, model.id, embedding, chunk_text, chunk_index, total_chunks
+                            document_id, model.id, embedding_str, chunk_text, chunk_index, total_chunks
                         )
 
                 # Insert article
@@ -466,11 +589,11 @@ class VectorDatabase:
                     tags or [], category, status, slug, seo_title, seo_description, og_image,
                     datetime.now() if status == 'published' else None
                 )
-
-                return {
+        
+        return {
                     'article_id': article_id,
-                    'document_id': document_id
-                }
+            'document_id': document_id
+        }
     
     async def update_article(
         self,
@@ -502,9 +625,8 @@ class VectorDatabase:
                 )
                 if not result:
                     raise ValueError(f"Article {article_id} not found")
-
+                
                 document_id = result['document_id']
-
                 # Update article
                 article_update_parts = []
                 article_params = []
@@ -576,7 +698,7 @@ class VectorDatabase:
                         """,
                         *article_params
                     )
-
+        
                 # Update document
                 doc_update_parts = []
                 doc_params = []
@@ -635,17 +757,19 @@ class VectorDatabase:
                         if model_name:
                             for chunk_index, chunk_text in enumerate(chunks):
                                 embedding = await self.create_embedding(chunk_text, model_name)
+                                # Convert list to pgvector format: '[0.1, 0.2, ...]'
+                                embedding_str = '[' + ','.join(map(str, embedding)) + ']'
 
                                 await conn.execute(
                                     """
                                     INSERT INTO embeddings
                                     (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                                    VALUES ($1, $2, $3, $4, $5, $6)
+                                    VALUES ($1, $2, $3::vector, $4, $5, $6)
                                     """,
-                                    document_id, model_id, embedding, chunk_text, chunk_index, total_chunks
-                                )
-
-                return True
+                                    document_id, model_id, embedding_str, chunk_text, chunk_index, total_chunks
+        )
+        
+        return True
     
     def delete_article(self, article_id: str, soft_delete: bool = True) -> bool:
         """Delete article and associated document"""
@@ -737,6 +861,10 @@ class VectorDatabase:
         async with self.pg_pool.acquire() as conn:
             async with conn.transaction():
                 # Insert profile data
+                # Convert string dates to date objects for asyncpg
+                parsed_start_date = self._parse_date(start_date or data.get('start_date'))
+                parsed_end_date = self._parse_date(end_date or data.get('end_date'))
+                
                 profile_id = await conn.fetchval(
                     """
                     INSERT INTO profile_data
@@ -745,8 +873,8 @@ class VectorDatabase:
                     RETURNING id
                     """,
                     user_id, category, json.dumps(data),
-                    start_date or data.get('start_date'),
-                    end_date or data.get('end_date'),
+                    parsed_start_date,
+                    parsed_end_date,
                     is_current or data.get('current', False),
                     is_featured, display_order
                 )
@@ -754,12 +882,9 @@ class VectorDatabase:
                 document_id = None
 
                 if searchable:
-                    # Get searchable_text (assuming it's generated by DB trigger or computed column)
-                    searchable_text_row = await conn.fetchrow(
-                        "SELECT searchable_text FROM profile_data WHERE id = $1",
-                        profile_id
-                    )
-                    searchable_text = searchable_text_row['searchable_text']
+                    # Generate searchable_text in Python (profile_data table doesn't have searchable_text column)
+                    # This replicates the trigger logic from update_profile_data_searchable_text()
+                    searchable_text = self._generate_searchable_text_from_profile_data(data)
 
                     # Insert document
                     document_id = await conn.fetchval(
@@ -782,14 +907,16 @@ class VectorDatabase:
 
                         for chunk_index, chunk_text in enumerate(chunks):
                             embedding = await self.create_embedding(chunk_text, model_name)
+                            # Convert list to pgvector format: '[0.1, 0.2, ...]'
+                            embedding_str = '[' + ','.join(map(str, embedding)) + ']'
 
                             await conn.execute(
                                 """
                                 INSERT INTO embeddings
                                 (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                                VALUES ($1, $2, $3, $4, $5, $6)
+                                VALUES ($1, $2, $3::vector, $4, $5, $6)
                                 """,
-                                document_id, model.id, embedding, chunk_text, chunk_index, total_chunks
+                                document_id, model.id, embedding_str, chunk_text, chunk_index, total_chunks
                             )
 
                     # Update profile_data with document_id
@@ -800,7 +927,7 @@ class VectorDatabase:
 
                 return {
                     'profile_id': profile_id,
-                    'document_id': document_id
+                'document_id': document_id
                 }
     
     async def update_profile_data(
@@ -830,7 +957,7 @@ class VectorDatabase:
 
                 if not profile:
                     raise ValueError(f"Profile data {profile_id} not found")
-
+        
                 current_data = json.loads(profile['data']) if isinstance(profile['data'], str) else profile['data']
                 document_id = profile['document_id']
 
@@ -847,12 +974,12 @@ class VectorDatabase:
 
                 if start_date is not None:
                     update_parts.append(f"start_date = ${param_count}")
-                    params.append(start_date)
+                    params.append(self._parse_date(start_date))
                     param_count += 1
 
                 if end_date is not None:
                     update_parts.append(f"end_date = ${param_count}")
-                    params.append(end_date)
+                    params.append(self._parse_date(end_date))
                     param_count += 1
 
                 if is_current is not None:
@@ -885,12 +1012,13 @@ class VectorDatabase:
 
                 # Recreate embeddings if needed
                 if document_id and recreate_embeddings and data:
-                    # Get updated searchable_text
+                    # Get updated data and generate searchable_text in Python
                     updated_profile = await conn.fetchrow(
-                        "SELECT searchable_text FROM profile_data WHERE id = $1",
+                        "SELECT data FROM profile_data WHERE id = $1",
                         profile_id
                     )
-                    searchable_text = updated_profile['searchable_text']
+                    updated_data = json.loads(updated_profile['data']) if isinstance(updated_profile['data'], str) else updated_profile['data']
+                    searchable_text = self._generate_searchable_text_from_profile_data(updated_data)
 
                     # Update document content
                     await conn.execute(
@@ -924,17 +1052,19 @@ class VectorDatabase:
                         if model_name:
                             for chunk_index, chunk_text in enumerate(chunks):
                                 embedding = await self.create_embedding(chunk_text, model_name)
+                                # Convert list to pgvector format: '[0.1, 0.2, ...]'
+                                embedding_str = '[' + ','.join(map(str, embedding)) + ']'
 
                                 await conn.execute(
                                     """
                                     INSERT INTO embeddings
                                     (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                                    VALUES ($1, $2, $3, $4, $5, $6)
+                                    VALUES ($1, $2, $3::vector, $4, $5, $6)
                                     """,
-                                    document_id, model_id, embedding, chunk_text, chunk_index, total_chunks
-                                )
-
-                return True
+                                    document_id, model_id, embedding_str, chunk_text, chunk_index, total_chunks
+            )
+        
+        return True
     
     def delete_profile_data(self, profile_id: str) -> bool:
         """Delete profile data"""
@@ -1035,10 +1165,10 @@ class VectorDatabase:
                         """,
                         user_id, title, searchable_text,
                         json.dumps({
-                            'source': 'personal_attribute',
-                            'attribute_type': attribute_type,
-                            'importance_score': importance_score,
-                            'confidence_level': confidence_level
+                    'source': 'personal_attribute',
+                    'attribute_type': attribute_type,
+                    'importance_score': importance_score,
+                    'confidence_level': confidence_level
                         }),
                         [attribute_type]
                     )
@@ -1052,14 +1182,16 @@ class VectorDatabase:
 
                         for chunk_index, chunk_text in enumerate(chunks):
                             embedding = await self.create_embedding(chunk_text, model_name)
+                            # Convert list to pgvector format: '[0.1, 0.2, ...]'
+                            embedding_str = '[' + ','.join(map(str, embedding)) + ']'
 
                             await conn.execute(
                                 """
                                 INSERT INTO embeddings
                                 (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                                VALUES ($1, $2, $3, $4, $5, $6)
+                                VALUES ($1, $2, $3::vector, $4, $5, $6)
                                 """,
-                                document_id, model.id, embedding, chunk_text, chunk_index, total_chunks
+                                document_id, model.id, embedding_str, chunk_text, chunk_index, total_chunks
                             )
 
                     # Update personal_attributes with document_id
@@ -1070,7 +1202,7 @@ class VectorDatabase:
 
                 return {
                     'attribute_id': attribute_id,
-                    'document_id': document_id
+                'document_id': document_id
                 }
     
     # ========================================================================
@@ -1165,15 +1297,15 @@ class VectorDatabase:
 
         async with self.pg_pool.acquire() as conn:
             async with conn.transaction():
-                # Get current attribute
+        # Get current attribute
                 attr = await conn.fetchrow(
                     "SELECT document_id FROM personal_attributes WHERE id = $1",
                     attribute_id
                 )
-
+        
                 if not attr:
                     raise ValueError(f"Personal attribute {attribute_id} not found")
-
+        
                 document_id = attr['document_id']
 
                 # Build update query
@@ -1271,16 +1403,18 @@ class VectorDatabase:
                         if model_name:
                             for chunk_index, chunk_text in enumerate(chunks):
                                 embedding = await self.create_embedding(chunk_text, model_name)
+                                # Convert list to pgvector format: '[0.1, 0.2, ...]'
+                                embedding_str = '[' + ','.join(map(str, embedding)) + ']'
 
                                 await conn.execute(
                                     """
                                     INSERT INTO embeddings
                                     (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                                    VALUES ($1, $2, $3, $4, $5, $6)
+                                    VALUES ($1, $2, $3::vector, $4, $5, $6)
                                     """,
-                                    document_id, model_id, embedding, chunk_text, chunk_index, total_chunks
+                                    document_id, model_id, embedding_str, chunk_text, chunk_index, total_chunks
                                 )
-
+        
                 return True
     
     def delete_personal_attribute(self, attribute_id: str) -> bool:
@@ -1334,7 +1468,18 @@ class VectorDatabase:
     ) -> List[Dict]:
         """
         Search across all content using vector similarity.
-        Uses the search_documents SQL function.
+        Uses the search_documents SQL function via Supabase RPC.
+            
+        Returns:
+            List of Dict with fields including:
+            - document_id, article_id, profile_data_id, personal_attribute_id
+            - title, content, chunk_text
+            - content_type, category, attribute_type
+            - similarity (FLOAT): Cosine similarity score (0-1, higher = more similar)
+            - metadata, tags, created_at
+        
+        Note: Uses Supabase client (single operation) - no transaction needed.
+        For multi-operation atomicity, use asyncpg pool with transactions.
         """
         query_embedding = await self.create_embedding(query, model_name)
         
@@ -1342,8 +1487,9 @@ class VectorDatabase:
         if not model:
             raise ValueError(f"Model {model_name} not found")
         
+        # Supabase RPC accepts List[float] directly - it handles conversion to vector type
         results = self.supabase.rpc('search_documents', {
-            'query_embedding': query_embedding,
+            'query_embedding': query_embedding,  # List[float] - Supabase converts to vector
             'model_id': model.id,
             'match_threshold': threshold,
             'match_count': limit,
@@ -1352,6 +1498,7 @@ class VectorDatabase:
             'filter_tags': tags
         }).execute()
         
+        # Results include 'similarity' field from SQL function
         return results.data
     
     async def search_all_rpc_function(
@@ -1600,3 +1747,39 @@ class VectorDatabase:
         slug = re.sub(r'[^a-z0-9]+', '-', slug)
         slug = slug.strip('-')
         return slug[:100]
+    
+    async def _create_unique_slug(self, title: str, conn: asyncpg.Connection, user_id: str) -> str:
+        """
+        Create a unique slug from title, checking for duplicates and appending suffix if needed.
+        
+        Args:
+            title: Article title
+            conn: Database connection
+            user_id: User ID to check for duplicates within user's articles
+            
+        Returns:
+            Unique slug string
+        """
+        base_slug = self._create_slug(title)
+        slug = base_slug
+        counter = 1
+        
+        # Check if slug exists for this user
+        while True:
+            existing = await conn.fetchval(
+                "SELECT id FROM articles WHERE slug = $1 AND user_id = $2",
+                slug, user_id
+            )
+            if existing is None:
+                break  # Slug is unique
+            # Append counter to make it unique
+            slug = f"{base_slug}-{counter}"
+            counter += 1
+            # Prevent infinite loop (max 1000 attempts)
+            if counter > 1000:
+                # Fallback: add timestamp
+                import time
+                slug = f"{base_slug}-{int(time.time())}"
+                break
+        
+        return slug

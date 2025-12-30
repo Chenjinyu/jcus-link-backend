@@ -27,14 +27,20 @@ from libs.vector_database import VectorDatabase
 # ============================================================================
 
 def create_db(
-    supabase_url,
-    supabase_key,
-    ollama_url
+    supabase_url: str,
+    supabase_key: str,
+    postgres_url: str,
+    ollama_url: str = 'http://localhost:11434',
+    openai_key: Optional[str] = None,
+    google_key: Optional[str] = None
     ) -> VectorDatabase:
     """Create and initialize VectorDatabase instance"""
     return VectorDatabase(
         supabase_url=supabase_url,
         supabase_key=supabase_key,
+        postgres_url=postgres_url,
+        openai_key=openai_key,
+        google_key=google_key,
         ollama_url=ollama_url
     )
 
