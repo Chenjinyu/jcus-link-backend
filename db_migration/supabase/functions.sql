@@ -58,11 +58,12 @@ $$;
 -- ============================================================================
 -- SEARCH DOCUMENTS (Simplified - no content_types)
 -- ============================================================================
-DROP FUNCTION IF EXISTS search_documents(vector, uuid, float, int, text, text[], text[]);
+DROP FUNCTION IF EXISTS search_documents(vector, uuid, int, float, int, text, text[], text[]);
 
 CREATE OR REPLACE FUNCTION search_documents(
   query_embedding vector,
   model_id UUID,
+  query_dims INTEGER DEFAULT NULL,
   match_threshold FLOAT DEFAULT 0.7,
   match_count INT DEFAULT 10,
   filter_user_id TEXT DEFAULT NULL,
@@ -92,110 +93,71 @@ LANGUAGE plpgsql
 SET search_path = public
 AS $$
 DECLARE
-  query_dims INTEGER;
+  effective_dims INTEGER;
+  sql_query TEXT;
 BEGIN
   -- Get query vector dimensions
-  query_dims := vector_dims(query_embedding);
-  
-  -- Execute query with dimension-specific casting
-  IF query_dims = 768 THEN
-    RETURN QUERY
-    SELECT 
-      e.id AS embedding_id,
-      d.id AS document_id,
-      a.id AS article_id,
-      p.id AS profile_data_id,
-      pa.id AS personal_attribute_id,
-      COALESCE(d.title, a.title, p.data->>'title', pa.title, 'Untitled') AS title,
-      d.content,
-      e.chunk_text,
-      e.chunk_index,
-      e.total_chunks,
-      -- Derive content_type from which table has data
-      CASE 
-        WHEN a.id IS NOT NULL THEN 'article'
-        WHEN p.id IS NOT NULL THEN p.category
-        WHEN pa.id IS NOT NULL THEN pa.attribute_type
-        ELSE 'document'
-      END AS content_type,
-      p.category,
-      pa.attribute_type,
-      1 - (e.embedding::vector(768) <=> query_embedding) AS similarity,
-      d.metadata,
-      d.tags,
-      d.created_at
-    FROM embeddings e
-    JOIN documents d ON e.document_id = d.id
-    LEFT JOIN articles a ON a.document_id = d.id
-    LEFT JOIN profile_data p ON p.document_id = d.id
-    LEFT JOIN personal_attributes pa ON pa.document_id = d.id
-    WHERE 
-      e.embedding_model_id = model_id
-      AND (1 - (e.embedding::vector(768) <=> query_embedding)) > match_threshold
-      AND d.is_current = TRUE
-      AND d.deleted_at IS NULL
-      AND (filter_user_id IS NULL OR d.user_id = filter_user_id)
-      AND (filter_content_types IS NULL OR 
-        CASE 
-          WHEN a.id IS NOT NULL THEN 'article'
-          WHEN p.id IS NOT NULL THEN p.category
-          WHEN pa.id IS NOT NULL THEN pa.attribute_type
-          ELSE 'document'
-        END = ANY(filter_content_types))
-      AND (filter_tags IS NULL OR d.tags && filter_tags)
-    ORDER BY e.embedding::vector(768) <=> query_embedding
-    LIMIT match_count;
-    
-  ELSIF query_dims = 1536 THEN
-    RETURN QUERY
-    SELECT 
-      e.id AS embedding_id,
-      d.id AS document_id,
-      a.id AS article_id,
-      p.id AS profile_data_id,
-      pa.id AS personal_attribute_id,
-      COALESCE(d.title, a.title, p.data->>'title', pa.title, 'Untitled') AS title,
-      d.content,
-      e.chunk_text,
-      e.chunk_index,
-      e.total_chunks,
-      CASE 
-        WHEN a.id IS NOT NULL THEN 'article'
-        WHEN p.id IS NOT NULL THEN p.category
-        WHEN pa.id IS NOT NULL THEN pa.attribute_type
-        ELSE 'document'
-      END AS content_type,
-      p.category,
-      pa.attribute_type,
-      1 - (e.embedding::vector(1536) <=> query_embedding) AS similarity,
-      d.metadata,
-      d.tags,
-      d.created_at
-    FROM embeddings e
-    JOIN documents d ON e.document_id = d.id
-    LEFT JOIN articles a ON a.document_id = d.id
-    LEFT JOIN profile_data p ON p.document_id = d.id
-    LEFT JOIN personal_attributes pa ON pa.document_id = d.id
-    WHERE 
-      e.embedding_model_id = model_id
-      AND (1 - (e.embedding::vector(1536) <=> query_embedding)) > match_threshold
-      AND d.is_current = TRUE
-      AND d.deleted_at IS NULL
-      AND (filter_user_id IS NULL OR d.user_id = filter_user_id)
-      AND (filter_content_types IS NULL OR 
-        CASE 
-          WHEN a.id IS NOT NULL THEN 'article'
-          WHEN p.id IS NOT NULL THEN p.category
-          WHEN pa.id IS NOT NULL THEN pa.attribute_type
-          ELSE 'document'
-        END = ANY(filter_content_types))
-      AND (filter_tags IS NULL OR d.tags && filter_tags)
-    ORDER BY e.embedding::vector(1536) <=> query_embedding
-    LIMIT match_count;
-    
+  IF query_dims IS NULL THEN
+    effective_dims := vector_dims(query_embedding);
   ELSE
-    RAISE EXCEPTION 'Unsupported vector dimension: %. Supported: 768, 1536', query_dims;
+    effective_dims := query_dims;
   END IF;
+
+  IF effective_dims NOT IN (768, 1536) THEN
+    RAISE EXCEPTION 'Unsupported vector dimension: %. Supported: 768, 1536', effective_dims;
+  END IF;
+
+  -- format as SQL statement with parameters
+  sql_query := format($fmt$
+    SELECT 
+      e.id AS embedding_id,
+      d.id AS document_id,
+      a.id AS article_id,
+      p.id AS profile_data_id,
+      pa.id AS personal_attribute_id,
+      COALESCE(d.title, a.title, p.data->>'title', pa.title, 'Untitled') AS title,
+      d.content,
+      e.chunk_text,
+      e.chunk_index,
+      e.total_chunks,
+      CASE 
+        WHEN a.id IS NOT NULL THEN 'article'
+        WHEN p.id IS NOT NULL THEN p.category
+        WHEN pa.id IS NOT NULL THEN pa.attribute_type
+        ELSE 'document'
+      END AS content_type,
+      p.category,
+      pa.attribute_type,
+      1 - (e.embedding::vector(%s) <=> $1) AS similarity,
+      d.metadata,
+      d.tags,
+      d.created_at
+    FROM embeddings e
+    JOIN documents d ON e.document_id = d.id
+    LEFT JOIN articles a ON a.document_id = d.id
+    LEFT JOIN profile_data p ON p.document_id = d.id
+    LEFT JOIN personal_attributes pa ON pa.document_id = d.id
+    WHERE 
+      e.embedding_model_id = $2
+      AND (1 - (e.embedding::vector(%s) <=> $1)) > $3
+      AND d.is_current = TRUE
+      AND d.deleted_at IS NULL
+      AND ($4 IS NULL OR d.user_id = $4)
+      AND ($5 IS NULL OR 
+        CASE 
+          WHEN a.id IS NOT NULL THEN 'article'
+          WHEN p.id IS NOT NULL THEN p.category
+          WHEN pa.id IS NOT NULL THEN pa.attribute_type
+          ELSE 'document'
+        END = ANY($5))
+      AND ($6 IS NULL OR d.tags && $6)
+    ORDER BY e.embedding::vector(%s) <=> $1
+    LIMIT $7
+  -- three effective_dims use for %s placeholders in the dynamic SQL string.
+  $fmt$, effective_dims, effective_dims, effective_dims); 
+
+  RETURN QUERY EXECUTE sql_query
+  USING query_embedding, model_id, match_threshold, filter_user_id, filter_content_types, filter_tags, match_count;
 END;
 $$;
 
@@ -522,69 +484,7 @@ CREATE TRIGGER update_personal_attributes_searchable_text_trigger
   FOR EACH ROW
   EXECUTE FUNCTION update_personal_attributes_searchable_text();
 
--- Profile Data
-DROP TRIGGER IF EXISTS update_profile_data_searchable_text_trigger ON profile_data;
-DROP FUNCTION IF EXISTS update_profile_data_searchable_text();
 
--- purpose: take structured JSONB data(NEW.data), extract common fields, and
--- combine them into a single searchable_text field for better searchability.
-CREATE OR REPLACE FUNCTION update_profile_data_searchable_text()
-RETURNS TRIGGER -- the func will be called by trigger, which receives NEW
-LANGUAGE plpgsql -- support variable, conditions, loop/logic
-SET search_path = public -- best practice and safety measure, to ensure all table/function refereneces to public
-AS $$
-DECLARE
-  text_parts TEXT[] := '{}';
-BEGIN
-  -- Extract searchable fields from JSONB based on common patterns
-  -- NEW is the row beling inserted or updated.
-  IF NEW.data ? 'title' THEN -- if NEW.data has the key of title
-    text_parts := array_append(text_parts, NEW.data->>'title');
-  END IF;
-  
-  IF NEW.data ? 'company' THEN
-    text_parts := array_append(text_parts, NEW.data->>'company');
-  END IF;
-  
-  IF NEW.data ? 'position' THEN
-    text_parts := array_append(text_parts, NEW.data->>'position');
-  END IF;
-  
-  IF NEW.data ? 'description' THEN
-    text_parts := array_append(text_parts, NEW.data->>'description');
-  END IF;
-  -- ->> etract data, -> extract JSON
-  IF NEW.data ? 'skills' THEN
-    -- Handle both string and array
-    IF jsonb_typeof(NEW.data->'skills') = 'array' THEN
-      text_parts := array_append(text_parts, 'Skills: ' || 
-        (SELECT string_agg(value::text, ', ') FROM jsonb_array_elements_text(NEW.data->'skills')));
-    ELSE
-      text_parts := array_append(text_parts, 'Skills: ' || (NEW.data->>'skills'));
-    END IF;
-  END IF;
-  
-  IF NEW.data ? 'achievements' THEN
-    text_parts := array_append(text_parts, NEW.data->>'achievements');
-  END IF;
-  
-  IF NEW.data ? 'responsibilities' THEN
-    text_parts := array_append(text_parts, NEW.data->>'responsibilities');
-  END IF;
-  
-  -- Join all parts
-  NEW.searchable_text := array_to_string(text_parts, '. ');
-  
-  RETURN NEW;
-END;
-$$;
-
--- create trigger when insert or update the profile_data, then call 
--- the function of update_profile_data_searchable_text
-CREATE TRIGGER update_profile_data_searchable_text_trigger
-  BEFORE INSERT OR UPDATE ON profile_data
-  FOR EACH ROW
-  EXECUTE FUNCTION update_profile_data_searchable_text();
 
 -- ============================================================================
 -- UPDATED TRIGGER: update_updated_at_column
@@ -661,7 +561,8 @@ BEGIN
     RAISE EXCEPTION 'Embedding model % not found', NEW.embedding_model_id;
   END IF;
   
-  actual_dims := vector_dims(NEW.embedding);
+  -- vector_dims provided by pgvector extension, which will gets the dimensions(length) for the vector data.
+  actual_dims := vector_dims(NEW.embedding); 
   
   IF actual_dims != expected_dims THEN
     RAISE EXCEPTION 'Embedding dimension mismatch for model %: expected %, got %',

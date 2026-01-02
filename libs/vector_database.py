@@ -63,6 +63,7 @@ class VectorDatabase:
             self.google_client = None
 
         self._models_cache: Dict[str, EmbeddingModel] = {}
+        self._models_by_id: Dict[str, EmbeddingModel] = {}
         self._load_models()
 
     async def init_pool(self):
@@ -232,6 +233,9 @@ class VectorDatabase:
                 is_local=model_data["is_local"],
                 cost_per_token=model_data.get("cost_per_token"),
             )
+            self._models_by_id[str(model_data["id"])] = self._models_cache[
+                model_data["name"]
+            ]
         print("--" * 20)
         print(self._models_cache)
 
@@ -305,6 +309,51 @@ class VectorDatabase:
     # DOCUMENT OPERATIONS
     # ========================================================================
 
+    @staticmethod
+    def _embedding_to_vector_str(embedding: List[float]) -> str:
+        return "[" + ",".join(map(str, embedding)) + "]"
+
+    async def _insert_embeddings_for_models(
+        self,
+        conn: asyncpg.Connection,
+        document_id: str,
+        chunks: List[str],
+        model_names: List[str],
+    ) -> None:
+        if not chunks:
+            return
+        total_chunks = len(chunks)
+        for model_name in model_names:
+            model = self._models_cache.get(model_name)
+            if not model:
+                raise ValueError(f"Model {model_name} not found or not active")
+
+            for chunk_index, chunk_text in enumerate(chunks):
+                embedding = await self.create_embedding(chunk_text, model_name)
+                embedding_str = self._embedding_to_vector_str(embedding)
+
+                await conn.execute(
+                    """
+                    INSERT INTO embeddings
+                    (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
+                    VALUES ($1, $2, $3::vector, $4, $5, $6)
+                    """,
+                    document_id,
+                    model.id,
+                    embedding_str,
+                    chunk_text,
+                    chunk_index,
+                    total_chunks,
+                )
+
+    def _get_model_names_from_ids(self, model_ids: List[str]) -> List[str]:
+        model_names = []
+        for model_id in model_ids:
+            model = self._models_by_id.get(str(model_id))
+            if model:
+                model_names.append(model.name)
+        return model_names
+
     async def add_document(
         self,
         user_id: str,
@@ -330,7 +379,6 @@ class VectorDatabase:
             model_names = list(self._models_cache.keys())
 
         chunks = self._chunk_text(content, chunk_size, chunk_overlap)
-        total_chunks = len(chunks)
 
         async with self.pg_pool.acquire() as conn:
             async with conn.transaction():
@@ -349,27 +397,9 @@ class VectorDatabase:
                 )
 
                 # Create and insert embeddings for each model
-                for model_name in model_names:
-                    model = self._models_cache[model_name]
-
-                    for chunk_index, chunk_text in enumerate(chunks):
-                        embedding = await self.create_embedding(chunk_text, model_name)
-                        # Convert list to pgvector format: '[0.1, 0.2, ...]'
-                        embedding_str = "[" + ",".join(map(str, embedding)) + "]"
-
-                        await conn.execute(
-                            """
-                            INSERT INTO embeddings
-                            (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                            VALUES ($1, $2, $3::vector, $4, $5, $6)
-                            """,
-                            document_id,
-                            model.id,
-                            embedding_str,
-                            chunk_text,
-                            chunk_index,
-                            total_chunks,
-                        )
+                await self._insert_embeddings_for_models(
+                    conn, document_id, chunks, model_names
+                )
 
         return document_id
 
@@ -418,17 +448,17 @@ class VectorDatabase:
                     param_count += 1
 
                 if update_parts:
-                    update_parts.append(f"updated_at = NOW()")
+                    update_parts.append("updated_at = NOW()")
                     params.append(document_id)
 
-                await conn.execute(
-                    f"""
-                    UPDATE documents
-                    SET {", ".join(update_parts)}
-                    WHERE id = ${param_count}
-                    """,
-                    *params,
-                )
+                    await conn.execute(
+                        f"""
+                        UPDATE documents
+                        SET {", ".join(update_parts)}
+                        WHERE id = ${param_count}
+                        """,
+                        *params,
+                    )
 
                 # Recreate embeddings if content changed
                 if recreate_embeddings and content is not None:
@@ -446,39 +476,12 @@ class VectorDatabase:
 
                     # Create new embeddings
                     chunks = self._chunk_text(content, chunk_size, chunk_overlap)
-                    total_chunks = len(chunks)
 
-                    for model_id in model_ids:
-                        model_name = next(
-                            (
-                                name
-                                for name, m in self._models_cache.items()
-                                if m.id == model_id
-                            ),
-                            None,
+                    model_names = self._get_model_names_from_ids(model_ids)
+                    if model_names:
+                        await self._insert_embeddings_for_models(
+                            conn, document_id, chunks, model_names
                         )
-
-                        if model_name:
-                            for chunk_index, chunk_text in enumerate(chunks):
-                                embedding = await self.create_embedding(
-                                    chunk_text, model_name
-                                )
-                                # Convert list to pgvector format: '[0.1, 0.2, ...]' when using raw sql.
-                                embedding_str = "[" + ",".join(map(str, embedding)) + "]"
-
-                                await conn.execute(
-                                    """
-                                    INSERT INTO embeddings
-                                    (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                                    VALUES ($1, $2, $3::vector, $4, $5, $6)
-                                    """,
-                                    document_id,
-                                    model_id,
-                                    embedding_str,
-                                    chunk_text,
-                                    chunk_index,
-                                    total_chunks,
-                                )
 
         return True
 
@@ -558,7 +561,7 @@ class VectorDatabase:
                 "p_metadata": metadata or {},
                 "p_tags": tags or [],
                 "p_embedding_model_name": model_name,
-                "p_chunks": json.dumps(chunks_json),
+                "p_chunks": chunks_json,
             },
         ).execute()
 
@@ -595,7 +598,6 @@ class VectorDatabase:
             model_names = list(self._models_cache.keys())
 
         chunks = self._chunk_text(content, chunk_size, chunk_overlap)
-        total_chunks = len(chunks)
 
         async with self.pg_pool.acquire() as conn:
             async with conn.transaction():
@@ -616,53 +618,35 @@ class VectorDatabase:
                     tags or [],
                 )
 
+                # Insert article
+                article_id = await conn.fetchval(
+                    """
+                    INSERT INTO articles
+                    (user_id, document_id, title, subtitle, content, excerpt, tags, category,
+                    status, slug, seo_title, seo_description, og_image, published_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                    RETURNING id
+                    """,
+                    user_id,
+                    document_id,
+                    title,
+                    subtitle,
+                    content,
+                    excerpt or content[:200],
+                    tags or [],
+                    category,
+                    status,
+                    slug,
+                    seo_title,
+                    seo_description,
+                    og_image,
+                    datetime.now() if status == "published" else None,
+                )
+
                 # Create embeddings
-                for model_name in model_names:
-                    model = self._models_cache[model_name]
-
-                    for chunk_index, chunk_text in enumerate(chunks):
-                        embedding = await self.create_embedding(chunk_text, model_name)
-                        # Convert list to pgvector format: '[0.1, 0.2, ...]'
-                        embedding_str = "[" + ",".join(map(str, embedding)) + "]"
-
-                        await conn.execute(
-                            """
-                            INSERT INTO embeddings
-                            (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                            VALUES ($1, $2, $3::vector, $4, $5, $6)
-                            """,
-                            document_id,
-                            model.id,
-                            embedding_str,
-                            chunk_text,
-                            chunk_index,
-                            total_chunks,
-                        )
-
-                        # Insert article
-                        article_id = await conn.fetchval(
-                            """
-                            INSERT INTO articles
-                            (user_id, document_id, title, subtitle, content, excerpt, tags, category,
-                            status, slug, seo_title, seo_description, og_image, published_at)
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-                            RETURNING id
-                            """,
-                            user_id,
-                            document_id,
-                            title,
-                            subtitle,
-                            content,
-                            excerpt or content[:200],
-                            tags or [],
-                            category,
-                            status,
-                            slug,
-                            seo_title,
-                            seo_description,
-                            og_image,
-                            datetime.now() if status == "published" else None,
-                        )
+                await self._insert_embeddings_for_models(
+                    conn, document_id, chunks, model_names
+                )
 
         return {"article_id": article_id, "document_id": document_id}
 
@@ -759,17 +743,17 @@ class VectorDatabase:
                     param_count += 1
 
                 if article_update_parts:
-                    article_update_parts.append(f"updated_at = NOW()")
+                    article_update_parts.append("updated_at = NOW()")
                     article_params.append(article_id)
 
-                await conn.execute(
-                    f"""
-                    UPDATE articles
-                    SET {", ".join(article_update_parts)}
-                    WHERE id = ${param_count}
-                    """,
-                    *article_params,
-                )
+                    await conn.execute(
+                        f"""
+                        UPDATE articles
+                        SET {", ".join(article_update_parts)}
+                        WHERE id = ${param_count}
+                        """,
+                        *article_params,
+                    )
 
                 # Update document
                 doc_update_parts = []
@@ -792,17 +776,17 @@ class VectorDatabase:
                     param_count += 1
 
                 if doc_update_parts:
-                    doc_update_parts.append(f"updated_at = NOW()")
+                    doc_update_parts.append("updated_at = NOW()")
                     doc_params.append(document_id)
 
-                await conn.execute(
-                    f"""
-                    UPDATE documents
-                    SET {", ".join(doc_update_parts)}
-                    WHERE id = ${param_count}
-                    """,
-                    *doc_params,
-                )
+                    await conn.execute(
+                        f"""
+                        UPDATE documents
+                        SET {", ".join(doc_update_parts)}
+                        WHERE id = ${param_count}
+                        """,
+                        *doc_params,
+                    )
 
                 # Recreate embeddings if needed
                 if recreate_embeddings and content is not None:
@@ -817,41 +801,11 @@ class VectorDatabase:
                     )
 
                     chunks = self._chunk_text(content, chunk_size, chunk_overlap)
-                    total_chunks = len(chunks)
-
-                    for model_id in model_ids:
-                        model_name = next(
-                            (
-                                name
-                                for name, m in self._models_cache.items()
-                                if m.id == model_id
-                            ),
-                            None,
+                    model_names = self._get_model_names_from_ids(model_ids)
+                    if model_names:
+                        await self._insert_embeddings_for_models(
+                            conn, document_id, chunks, model_names
                         )
-
-                        if model_name:
-                            for chunk_index, chunk_text in enumerate(chunks):
-                                embedding = await self.create_embedding(
-                                    chunk_text, model_name
-                                )
-                                # Convert list to pgvector format: '[0.1, 0.2, ...]'
-                                embedding_str = (
-                                    "[" + ",".join(map(str, embedding)) + "]"
-                                )
-
-                                await conn.execute(
-                                    """
-                                    INSERT INTO embeddings
-                                    (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                                    VALUES ($1, $2, $3::vector, $4, $5, $6)
-                                    """,
-                                    document_id,
-                                    model_id,
-                                    embedding_str,
-                                    chunk_text,
-                                    chunk_index,
-                                    total_chunks,
-                                )
 
         return True
 
@@ -941,8 +895,11 @@ class VectorDatabase:
             "education",
             "certification",
             "skill",
+            "value",
+            "goal",
             "project",
-            "volunteer",
+            "volunteering",
+            "event",
         ],
         data: Dict,
         searchable: bool = True,
@@ -1023,31 +980,9 @@ class VectorDatabase:
                     chunks = self._chunk_text(
                         searchable_text, chunk_size, chunk_overlap
                     )
-                    total_chunks = len(chunks)
-
-                    for model_name in model_names:
-                        model = self._models_cache[model_name]
-
-                        for chunk_index, chunk_text in enumerate(chunks):
-                            embedding = await self.create_embedding(
-                                chunk_text, model_name
-                            )
-                            # Convert list to pgvector format: '[0.1, 0.2, ...]'
-                            embedding_str = "[" + ",".join(map(str, embedding)) + "]"
-
-                            await conn.execute(
-                                """
-                                INSERT INTO embeddings
-                                (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                                VALUES ($1, $2, $3::vector, $4, $5, $6)
-                                """,
-                                document_id,
-                                model.id,
-                                embedding_str,
-                                chunk_text,
-                                chunk_index,
-                                total_chunks,
-                            )
+                    await self._insert_embeddings_for_models(
+                        conn, document_id, chunks, model_names
+                    )
 
                     # Update profile_data with document_id
                     await conn.execute(
@@ -1182,41 +1117,12 @@ class VectorDatabase:
                     chunks = self._chunk_text(
                         searchable_text, chunk_size, chunk_overlap
                     )
-                    total_chunks = len(chunks)
 
-                    for model_id in model_ids:
-                        model_name = next(
-                            (
-                                name
-                                for name, m in self._models_cache.items()
-                                if m.id == model_id
-                            ),
-                            None,
+                    model_names = self._get_model_names_from_ids(model_ids)
+                    if model_names:
+                        await self._insert_embeddings_for_models(
+                            conn, document_id, chunks, model_names
                         )
-
-                        if model_name:
-                            for chunk_index, chunk_text in enumerate(chunks):
-                                embedding = await self.create_embedding(
-                                    chunk_text, model_name
-                                )
-                                # Convert list to pgvector format: '[0.1, 0.2, ...]'
-                                embedding_str = (
-                                    "[" + ",".join(map(str, embedding)) + "]"
-                                )
-
-                                await conn.execute(
-                                    """
-                                    INSERT INTO embeddings
-                                    (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                                    VALUES ($1, $2, $3::vector, $4, $5, $6)
-                                    """,
-                                    document_id,
-                                    model_id,
-                                    embedding_str,
-                                    chunk_text,
-                                    chunk_index,
-                                    total_chunks,
-                                )
 
         return True
 
@@ -1331,6 +1237,7 @@ class VectorDatabase:
                 document_id = None
 
                 if searchable:
+                    # the SQL function: update_personal_attributes_searchable_text_trigger will be triggered before insert or update on personal_attributes table
                     # Get searchable_text
                     searchable_text_row = await conn.fetchrow(
                         "SELECT searchable_text FROM personal_attributes WHERE id = $1",
@@ -1363,31 +1270,9 @@ class VectorDatabase:
                     chunks = self._chunk_text(
                         searchable_text, chunk_size, chunk_overlap
                     )
-                    total_chunks = len(chunks)
-
-                    for model_name in model_names:
-                        model = self._models_cache[model_name]
-
-                        for chunk_index, chunk_text in enumerate(chunks):
-                            embedding = await self.create_embedding(
-                                chunk_text, model_name
-                            )
-                            # Convert list to pgvector format: '[0.1, 0.2, ...]'
-                            embedding_str = "[" + ",".join(map(str, embedding)) + "]"
-
-                            await conn.execute(
-                                """
-                                INSERT INTO embeddings
-                                (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                                VALUES ($1, $2, $3::vector, $4, $5, $6)
-                                """,
-                                document_id,
-                                model.id,
-                                embedding_str,
-                                chunk_text,
-                                chunk_index,
-                                total_chunks,
-                            )
+                    await self._insert_embeddings_for_models(
+                        conn, document_id, chunks, model_names
+                    )
 
                     # Update personal_attributes with document_id
                     await conn.execute(
@@ -1600,41 +1485,12 @@ class VectorDatabase:
                     chunks = self._chunk_text(
                         searchable_text, chunk_size, chunk_overlap
                     )
-                    total_chunks = len(chunks)
 
-                    for model_id in model_ids:
-                        model_name = next(
-                            (
-                                name
-                                for name, m in self._models_cache.items()
-                                if m.id == model_id
-                            ),
-                            None,
+                    model_names = self._get_model_names_from_ids(model_ids)
+                    if model_names:
+                        await self._insert_embeddings_for_models(
+                            conn, document_id, chunks, model_names
                         )
-
-                        if model_name:
-                            for chunk_index, chunk_text in enumerate(chunks):
-                                embedding = await self.create_embedding(
-                                    chunk_text, model_name
-                                )
-                                # Convert list to pgvector format: '[0.1, 0.2, ...]'
-                                embedding_str = (
-                                    "[" + ",".join(map(str, embedding)) + "]"
-                                )
-
-                                await conn.execute(
-                                    """
-                                    INSERT INTO embeddings
-                                    (document_id, embedding_model_id, embedding, chunk_text, chunk_index, total_chunks)
-                                    VALUES ($1, $2, $3::vector, $4, $5, $6)
-                                    """,
-                                    document_id,
-                                    model_id,
-                                    embedding_str,
-                                    chunk_text,
-                                    chunk_index,
-                                    total_chunks,
-                                )
 
                 return True
 
@@ -1788,7 +1644,7 @@ class VectorDatabase:
         model_name: str = "nomic-embed-text-768",
     ) -> Dict[str, any]:
         """Intelligently find and update documents based on semantic similarity"""
-        matches = await self.search(
+        matches = await self.search_rpc_function(
             query=update_description,
             user_id=user_id,
             content_types=[content_type] if content_type else None,
@@ -1875,7 +1731,7 @@ class VectorDatabase:
         model_name: str = "nomic-embed-text-768",
     ) -> List[Dict]:
         """Find potential updates but don't apply them yet"""
-        matches = await self.search(
+        matches = await self.search_rpc_function(
             query=update_request,
             user_id=user_id,
             threshold=0.75,
