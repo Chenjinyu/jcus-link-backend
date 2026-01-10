@@ -107,33 +107,57 @@ async def insert_article_example(db: VectorDatabase, user_id: str):
 async def insert_work_experience_example(db: VectorDatabase, user_id: str):
     """Example: Insert work experience"""
     print("\n💼 Inserting Work Experience...")
+    work_experiences = [
+        {
+            "title": "Softare Engineer",
+            "company": "Tieto",
+            "location": "Chengdu, China",
+            "description": """Industry: Computer Services
+I. Department: Device UI Tool Position: Automation Test Engineer 
+Project: Nokia UI Tool development.
+My Work:
+1. Java Desktop Application Automation Test Cases Development. Java language wrote test case with RFT tool. 
+2. QT Desktop Application Automation Test Cases Development. Ruby language wrote test case with Testability Driver tool.
+3. Mobile Phone Automation Test Case Development. Ruby language wrote test cases which were used in socket connection with QT language.
+4. Test cases run on Jenkins which integrated Robot Framework plugin. 
+5. Agile Project Management. 
+Keywords: JAVA, QT, Ruby, Python, Testability Driver, BDD (Behavior Driven Development), RFT (Rational Functional Tester), Agile Project Management, Robot Framework, QT Creator, Eclipse.
 
-    result = await db.add_profile_data(
-        user_id=user_id,
-        category="work_experience",
-        data={
-            "title": "Senior Software Engineer",
-            "company": "Tech Corp",
-            "location": "San Francisco, CA",
-            "description": "Led development of microservices architecture. Built REST APIs using FastAPI and Python.",
-            "start_date": "2022-01-01",
-            "end_date": None,  # Current position
-            "current": True,
-            "technologies": ["Python", "FastAPI", "PostgreSQL", "Docker", "Kubernetes"],
+II. Department: Device SU Tool Position: QT Developer (Internal position transfer)
+Project: Meego & Symbian application development.
+My Work: Develop QML frontend and QT backend. 
+Keywords: QT, QML, QT Creator.
+
+III. Department: Network Position: Software Developer (Internal position transfer) 
+Project: LTE Network Management.
+My Work:
+1. Python Common Libraries development and maintenance in a virtual TA Team.
+2. Automation Test Cases development based on Robot Framework which integrated into Jenkins.
+Keywords: Python, JAVA, Jenkins, Robot Framework, BDD (Behavior Driven Development), Agile Project Management, Eclipse, etc.""",
+            "start_date": "2009-12-01",
+            "end_date": "2012-12-25",  # Current position
+            "current": False,
+            "technologies": ["Java", "QT Desktop", "Robot Framework", "Ruby", "BDD(Behavior Driven Development)", "Jenkins", "Eclipse", "Ruby"],
             "achievements": [
-                "Reduced API response time by 40%",
-                "Led team of 5 engineers",
-                "Implemented CI/CD pipeline",
+                "Implemented automated test suites that reduced manual testing time by 40%",
+                "Developed the QT Destkop application that used for Nokia mobile phone UI",
             ],
-        },
-        searchable=True,  # Creates embeddings for search
-        model_names=None,
-    )
-
-    print(f"✅ Work experience inserted:")
-    print(f"   Profile ID: {result['profile_id']}")
-    print(f"   Document ID: {result['document_id']}")
-    return result
+        }
+    ]
+    results = []
+    for exp in work_experiences:
+        result = await db.add_profile_data(
+            user_id=user_id,
+            category="work_experience",
+            data=exp,
+            searchable=True,
+            model_names=None,
+        )
+        print(f"✅ Work experience inserted:")
+        print(f"   Profile ID: {result['profile_id']}")
+        print(f"   Document ID: {result['document_id']}")
+        results.append(result)
+    return results
 
 
 async def insert_education_example(db: VectorDatabase, user_id: str):
@@ -144,14 +168,14 @@ async def insert_education_example(db: VectorDatabase, user_id: str):
         user_id=user_id,
         category="education",
         data={
-            "institution": "University of Technology",
-            "degree": "Bachelor of Science in Computer Science",
-            "field_of_study": "Computer Science",
-            "start_date": "2018-09-01",
-            "end_date": "2022-05-15",
+            "institution": "The University of Texas at Dallas",
+            "degree": "Master",
+            "field_of_study": "System Engineering and Management",
+            "start_date": "2017-06-01",
+            "end_date": "2019-03-15",
             "gpa": 3.8,
-            "honors": ["Summa Cum Laude", "Dean's List"],
-            "description": "Focused on software engineering and machine learning",
+            "honors": [],
+            "description": "",
         },
         searchable=True,
         model_names=None,
@@ -194,12 +218,12 @@ async def insert_certification_example(db: VectorDatabase, user_id: str):
         user_id=user_id,
         category="certification",
         data={
-            "name": "AWS Certified Solutions Architect",
+            "name": "AWS Certified Developer - Associate",
             "issuer": "Amazon Web Services",
-            "issue_date": "2023-06-01",
-            "expiry_date": "2026-06-01",
-            "credential_id": "AWS-CSA-12345",
-            "description": "Demonstrates expertise in designing distributed systems on AWS",
+            "issue_date": "2019-09-01",
+            "expiry_date": "2022-09-01",
+            "credential_id": "OADO9acSt0iz0clpBvWBlQ2",
+            "description": """Developing Serverless Solutions on AWS""",
         },
         searchable=True,
         model_names=None,

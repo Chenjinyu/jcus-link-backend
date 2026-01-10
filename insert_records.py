@@ -82,23 +82,23 @@ async def main():
     # Run examples
     try:
         # Basic examples
-        await db_helper.insert_document_example(db, JC_USER_ID)
-        await db_helper.insert_article_example(db, JC_USER_ID)
+        # await db_helper.insert_document_example(db, JC_USER_ID)
+        # await db_helper.insert_article_example(db, JC_USER_ID)
 
         # Profile data examples
-        await db_helper.insert_work_experience_example(db, JC_USER_ID)
+        # await db_helper.insert_work_experience_example(db, JC_USER_ID)
         await db_helper.insert_education_example(db, JC_USER_ID)
-        await db_helper.insert_skill_example(db, JC_USER_ID)
-        await db_helper.insert_certification_example(db, JC_USER_ID)
+        # await db_helper.insert_skill_example(db, JC_USER_ID)
+        # await db_helper.insert_certification_example(db, JC_USER_ID)
 
         # # Personal attributes examples
-        await db_helper.insert_value_example(db, JC_USER_ID)
-        await db_helper.insert_principle_example(db, JC_USER_ID)
-        await db_helper.insert_aspiration_example(db, JC_USER_ID)
+        # await db_helper.insert_value_example(db, JC_USER_ID)
+        # await db_helper.insert_principle_example(db, JC_USER_ID)
+        # await db_helper.insert_aspiration_example(db, JC_USER_ID)
 
         # # Batch examples (uncomment to use)
-        await db_helper.insert_multiple_work_experiences(db, JC_USER_ID)
-        await db_helper.insert_multiple_skills(db, JC_USER_ID)
+        # await db_helper.insert_multiple_work_experiences(db, JC_USER_ID)
+        # await db_helper.insert_multiple_skills(db, JC_USER_ID)
 
         print("\n" + "=" * 70)
         print("✅ All examples completed successfully!")
